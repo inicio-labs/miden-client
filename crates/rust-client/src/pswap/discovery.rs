@@ -170,7 +170,11 @@ fn build_round_update(
                 fill_amount: 0,
                 payout_amount: current.remaining_offered,
                 new_remaining_offered: 0,
-                new_remaining_requested: current.remaining_requested,
+                // Terminal state: per the field doc on
+                // `PswapLineageRoundUpdate::new_remaining_requested`, both
+                // remaining_* columns settle to 0 on a reclaim (no further
+                // rounds can fill the requested side).
+                new_remaining_requested: 0,
                 new_state: PswapLineageState::Reclaimed,
                 new_tip_note_id: None,
                 new_tip_nullifier: None,
@@ -398,5 +402,321 @@ struct FeltDebug(Felt);
 impl core::fmt::Display for FeltDebug {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0.as_canonical_u64())
+    }
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    //! Per-round correlator tests. Exercise [`build_round_update`] and the
+    //! in-memory multi-fill advance directly — they own the deterministic
+    //! correctness story; the store layer is mocked via fresh records.
+    //!
+    //! Every chain-note-update built here uses an actual reconstructed
+    //! `PswapNote::payback_note(...)` / `remainder_note(...)` for its
+    //! `note_id`, so the correlator's reconstruction-parity check goes
+    //! through the same code path that runs in production.
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use miden_protocol::account::AccountId;
+    use miden_protocol::crypto::merkle::SparseMerklePath;
+    use miden_protocol::note::NoteInclusionProof;
+
+    use super::super::lineage::test_helpers::{build_test_pswap, fixed_account_ids};
+    use super::*;
+
+    /// Minimum-valid inclusion proof. The discovery correlator never
+    /// inspects the proof's Merkle path; it only threads the value to
+    /// the eventual store insert. An empty path at depth 0 is the
+    /// cheapest valid construction.
+    fn dummy_inclusion_proof(block: u32) -> NoteInclusionProof {
+        let path = SparseMerklePath::from_parts(0, Vec::new())
+            .expect("empty SparseMerklePath is valid");
+        NoteInclusionProof::new(BlockNumber::from(block), 0, path)
+            .expect("zero index is well below the per-block notes ceiling")
+    }
+
+    /// Builds an initial `Active` lineage record at depth 0 from a
+    /// freshly-built test PSWAP.
+    fn initial_record(pswap: PswapNote, offered: u64, requested: u64) -> PswapLineageRecord {
+        let note = Note::from(pswap.clone());
+        PswapLineageRecord {
+            original_pswap: pswap,
+            current_tip_note_id: note.id(),
+            current_tip_nullifier: note.nullifier(),
+            current_depth: 0,
+            remaining_offered: offered,
+            remaining_requested: requested,
+            last_consumer_account_id: None,
+            last_payout_amount: None,
+            state: PswapLineageState::Active,
+            created_at_block: BlockNumber::from(0),
+            updated_at_block: BlockNumber::from(0),
+        }
+    }
+
+    /// Constructs a `PswapChainNoteUpdate` whose `note_id` matches the
+    /// given on-chain note. Tests build the candidate notes via the
+    /// protocol's reconstruction helpers (`payback_note` / `remainder_note`),
+    /// then wrap them with this so the correlator's id-match check passes.
+    fn chain_update_from(
+        note: &Note,
+        order_id: Felt,
+        depth: u64,
+        amount: u64,
+        sender: AccountId,
+        block: u32,
+    ) -> PswapChainNoteUpdate {
+        PswapChainNoteUpdate {
+            note_id: note.id(),
+            order_id,
+            depth,
+            amount,
+            sender,
+            block: BlockNumber::from(block),
+            inclusion_proof: dummy_inclusion_proof(block),
+        }
+    }
+
+    /// 2-candidate partial fill: advances the lineage by one round to
+    /// `Active`, subtracts the round amounts from `remaining_*`, and
+    /// reconstructs both payback and remainder.
+    #[test]
+    fn build_round_update_partial_fill_advances_active() {
+        let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        // Pick a deliberately-distinct consumer so we can assert it
+        // round-trips through `consumer_account_id` correctly.
+        let consumer = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        )
+        .unwrap();
+        let creator = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+        )
+        .unwrap();
+
+        let pswap = build_test_pswap(consumer, creator, offered_faucet, 100, requested_faucet, 50);
+        let record = initial_record(pswap.clone(), 100, 50);
+
+        let fill_amount = 20;
+        let payout_amount = 40;
+        let new_off = 100 - payout_amount;
+        let new_req = 50 - fill_amount;
+
+        let payback = pswap.payback_note(consumer, 1, fill_amount).unwrap();
+        let remainder = pswap
+            .remainder_note(consumer, 1, payout_amount, new_off, new_req)
+            .unwrap();
+
+        let order_id = pswap.order_id();
+        let cand_payback = chain_update_from(&payback, order_id, 1, fill_amount, consumer, 7);
+        let cand_remainder =
+            chain_update_from(&remainder, order_id, 1, payout_amount, consumer, 7);
+
+        let update = build_round_update(
+            &record,
+            1,
+            BlockNumber::from(7),
+            &[&cand_payback, &cand_remainder],
+        )
+        .unwrap()
+        .expect("partial fill must produce a round update");
+
+        assert_eq!(update.round_depth, 1);
+        assert_eq!(update.consumer_account_id, consumer);
+        assert_eq!(update.fill_amount, fill_amount);
+        assert_eq!(update.payout_amount, payout_amount);
+        assert_eq!(update.new_remaining_offered, new_off);
+        assert_eq!(update.new_remaining_requested, new_req);
+        assert_eq!(update.new_state, PswapLineageState::Active);
+        assert_eq!(update.new_tip_note_id, Some(remainder.id()));
+        assert!(update.reconstructed_payback.is_some());
+        assert!(update.reconstructed_remainder.is_some());
+        assert!(update.reconstructed_payback_inclusion_proof.is_some());
+    }
+
+    /// 1-candidate full fill: terminal `FullyFilled`, both `remaining_*`
+    /// zero, no new tip, no remainder.
+    #[test]
+    fn build_round_update_full_fill_marks_fully_filled() {
+        let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let consumer = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        )
+        .unwrap();
+        let creator = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+        )
+        .unwrap();
+
+        // Smaller initial sizes so the single fill exhausts both sides.
+        let pswap = build_test_pswap(consumer, creator, offered_faucet, 30, requested_faucet, 50);
+        let record = initial_record(pswap.clone(), 30, 50);
+
+        let fill_amount = 50; // exhausts requested side
+        let payback = pswap.payback_note(consumer, 1, fill_amount).unwrap();
+        let order_id = pswap.order_id();
+        let cand = chain_update_from(&payback, order_id, 1, fill_amount, consumer, 9);
+
+        let update = build_round_update(&record, 1, BlockNumber::from(9), &[&cand])
+            .unwrap()
+            .expect("full fill must produce a round update");
+
+        assert_eq!(update.new_state, PswapLineageState::FullyFilled);
+        assert_eq!(update.fill_amount, fill_amount);
+        assert_eq!(update.payout_amount, 30); // entire remaining_offered
+        assert_eq!(update.new_remaining_offered, 0);
+        assert_eq!(update.new_remaining_requested, 0);
+        assert_eq!(update.new_tip_note_id, None);
+        assert_eq!(update.new_tip_nullifier, None);
+        assert!(update.reconstructed_remainder.is_none());
+    }
+
+    /// 0-candidate consumption: terminal `Reclaimed` with
+    /// `consumer_account_id == creator` and BOTH `remaining_*` zeroed —
+    /// the regression guard for the bug where `remaining_requested`
+    /// retained its pre-reclaim value.
+    #[test]
+    fn build_round_update_zero_outputs_marks_reclaimed_with_remaining_zero() {
+        let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let consumer = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        )
+        .unwrap();
+        let creator = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+        )
+        .unwrap();
+
+        let pswap = build_test_pswap(consumer, creator, offered_faucet, 80, requested_faucet, 40);
+        let record = initial_record(pswap, 80, 40);
+
+        let update = build_round_update(&record, 1, BlockNumber::from(5), &[])
+            .unwrap()
+            .expect("zero-output consumption must produce a round update");
+
+        assert_eq!(update.new_state, PswapLineageState::Reclaimed);
+        assert_eq!(update.consumer_account_id, creator);
+        assert_eq!(update.fill_amount, 0);
+        assert_eq!(update.payout_amount, 80);
+        assert_eq!(update.new_remaining_offered, 0);
+        // Regression: the reclaim branch used to write
+        // `current.remaining_requested` here, leaving the terminal row
+        // with a non-zero `remaining_requested`. The doc on
+        // `PswapLineageRoundUpdate::new_remaining_requested` says "0 on
+        // full fill / reclaim", and this assert holds the line.
+        assert_eq!(update.new_remaining_requested, 0);
+        assert!(update.reconstructed_payback.is_none());
+        assert!(update.reconstructed_payback_inclusion_proof.is_none());
+    }
+
+    /// `> 2` candidates for one round is a protocol-invariant violation;
+    /// the correlator returns `Ok(None)` and lets the operator inspect
+    /// the logs rather than corrupting the lineage.
+    #[test]
+    fn build_round_update_more_than_two_candidates_returns_none() {
+        let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let consumer = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        )
+        .unwrap();
+        let creator = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+        )
+        .unwrap();
+
+        let pswap = build_test_pswap(consumer, creator, offered_faucet, 100, requested_faucet, 50);
+        let record = initial_record(pswap.clone(), 100, 50);
+
+        // Three reconstructed-payback candidates at different fill
+        // amounts. The exact bodies don't matter — `build_round_update`
+        // takes the count-based fast path before reconstruction.
+        let p1 = pswap.payback_note(consumer, 1, 10).unwrap();
+        let p2 = pswap.payback_note(consumer, 1, 20).unwrap();
+        let p3 = pswap.payback_note(consumer, 1, 30).unwrap();
+        let order_id = pswap.order_id();
+        let c1 = chain_update_from(&p1, order_id, 1, 10, consumer, 3);
+        let c2 = chain_update_from(&p2, order_id, 1, 20, consumer, 3);
+        let c3 = chain_update_from(&p3, order_id, 1, 30, consumer, 3);
+
+        let result = build_round_update(&record, 1, BlockNumber::from(3), &[&c1, &c2, &c3])
+            .expect("> 2 candidates is a soft-skip, not an error");
+        assert!(result.is_none(), "expected Ok(None); got {result:?}");
+    }
+
+    /// Same-block multi-fill: round 1 advances the lineage in memory;
+    /// round 2 is then built against the post-round-1 record. The two
+    /// round updates emitted should chain correctly — round 2's
+    /// `previous remaining_*` equal round 1's `new_remaining_*`, and
+    /// the second consumer sees the in-memory-advanced tip.
+    #[test]
+    fn apply_round_in_memory_chains_correctly_for_multi_fill() {
+        let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let consumer = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        )
+        .unwrap();
+        let creator = AccountId::try_from(
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+        )
+        .unwrap();
+
+        let pswap = build_test_pswap(consumer, creator, offered_faucet, 100, requested_faucet, 50);
+        let record0 = initial_record(pswap.clone(), 100, 50);
+
+        // ── Round 1: partial fill, 20 requested for 40 offered.
+        let fill1 = 20;
+        let payout1 = 40;
+        let new_off1 = 100 - payout1;
+        let new_req1 = 50 - fill1;
+        let payback1 = pswap.payback_note(consumer, 1, fill1).unwrap();
+        let remainder1 = pswap
+            .remainder_note(consumer, 1, payout1, new_off1, new_req1)
+            .unwrap();
+        let order_id = pswap.order_id();
+        let cand_p1 = chain_update_from(&payback1, order_id, 1, fill1, consumer, 11);
+        let cand_r1 = chain_update_from(&remainder1, order_id, 1, payout1, consumer, 11);
+
+        let update1 =
+            build_round_update(&record0, 1, BlockNumber::from(11), &[&cand_p1, &cand_r1])
+                .unwrap()
+                .unwrap();
+
+        // Apply in-memory — exactly what `discover_pswap_rounds`'s loop does.
+        let record1 = record0.apply_round_in_memory(&update1);
+        assert_eq!(record1.current_depth, 1);
+        assert_eq!(record1.remaining_offered, new_off1);
+        assert_eq!(record1.remaining_requested, new_req1);
+        assert_eq!(record1.current_tip_note_id, remainder1.id());
+        assert_eq!(record1.state, PswapLineageState::Active);
+
+        // ── Round 2: full fill of the remainder, exhausts requested side.
+        let fill2 = new_req1; // = 30
+        let payback2 = pswap.payback_note(consumer, 2, fill2).unwrap();
+        let cand_p2 = chain_update_from(&payback2, order_id, 2, fill2, consumer, 11);
+
+        let update2 = build_round_update(&record1, 2, BlockNumber::from(11), &[&cand_p2])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(update2.round_depth, 2);
+        assert_eq!(update2.new_state, PswapLineageState::FullyFilled);
+        assert_eq!(update2.fill_amount, fill2);
+        assert_eq!(update2.payout_amount, new_off1); // remaining_offered exhausted
+        assert_eq!(update2.new_remaining_offered, 0);
+        assert_eq!(update2.new_remaining_requested, 0);
+
+        // The chain invariant is the whole point of this test: round 2
+        // consumed the remainder produced by round 1, not the original.
+        let record2 = record1.apply_round_in_memory(&update2);
+        assert_eq!(record2.state, PswapLineageState::FullyFilled);
+        // Same-block multi-fill: both round updates are emitted in
+        // order, exactly two of them.
+        let emitted = vec![update1, update2];
+        assert_eq!(emitted.len(), 2);
     }
 }

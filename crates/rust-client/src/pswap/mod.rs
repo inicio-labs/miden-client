@@ -169,3 +169,135 @@ fn build_initial_lineage_record(
         updated_at_block: submission_height,
     }
 }
+
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+
+use alloc::vec::Vec;
+
+use miden_protocol::Felt;
+use miden_protocol::account::AccountId;
+use miden_protocol::note::NoteId;
+
+use crate::store::NoteFilter;
+use crate::transaction::{TransactionRequest, TransactionRequestBuilder};
+
+impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
+    /// Returns every PSWAP lineage tracked by this client.
+    pub async fn pswap_lineages(&self) -> Result<Vec<PswapLineageRecord>, ClientError> {
+        self.store
+            .list_pswap_lineages(PswapLineageFilter::All)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Returns lineages created by a specific local account.
+    pub async fn pswap_lineages_for(
+        &self,
+        creator: AccountId,
+    ) -> Result<Vec<PswapLineageRecord>, ClientError> {
+        self.store
+            .list_pswap_lineages(PswapLineageFilter::ByCreator(creator))
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Returns the lineage for one order, or `None` if not tracked.
+    pub async fn pswap_lineage(
+        &self,
+        order_id: Felt,
+    ) -> Result<Option<PswapLineageRecord>, ClientError> {
+        self.store.get_pswap_lineage(order_id).await.map_err(Into::into)
+    }
+
+    /// Builds a transaction request that reclaims the unfilled offered
+    /// asset on the *current tip* of an Active lineage. Works whether
+    /// the tip is the original PSWAP (`current_depth == 0`) or a
+    /// remainder this client never originated (`current_depth > 0`) —
+    /// in the latter case the tip is reconstructed byte-identically
+    /// via `PswapNote::remainder_note`.
+    ///
+    /// Errors:
+    /// - [`PswapLineageError::NotFound`] if no lineage exists for `order_id`.
+    /// - [`PswapLineageError::NotActive`] if the lineage already terminated
+    ///   (`FullyFilled` or `Reclaimed`).
+    /// - [`PswapLineageError::Reconstruction`] if the protocol's
+    ///   `remainder_note` helper rejects the stored inputs (indicates
+    ///   row corruption or protocol/client version skew).
+    /// - [`PswapLineageError::TipMissing`] if `current_depth == 0` but
+    ///   the original output note is not in the local `output_notes`
+    ///   table — implies a sync regression.
+    pub async fn build_pswap_cancel_by_order(
+        &self,
+        order_id: Felt,
+    ) -> Result<TransactionRequest, ClientError> {
+        let lineage = self
+            .store
+            .get_pswap_lineage(order_id)
+            .await?
+            .ok_or(PswapLineageError::NotFound(order_id))?;
+
+        if lineage.state != PswapLineageState::Active {
+            return Err(PswapLineageError::NotActive(lineage.state.as_u8()).into());
+        }
+
+        let tip_note: Note = if lineage.current_depth == 0 {
+            // The original PSWAP is in the local store as an output
+            // note we minted ourselves. The exact recipient is needed
+            // for `build_pswap_cancel` to recompute the script root;
+            // fetching it from the store is canonical.
+            let record = self
+                .store
+                .get_output_notes(NoteFilter::Unique(lineage.current_tip_note_id))
+                .await?
+                .into_iter()
+                .next()
+                .ok_or(PswapLineageError::TipMissing)?;
+            record.try_into().map_err(ClientError::NoteRecordConversionError)?
+        } else {
+            // The current tip is a remainder this client never
+            // originated. Reconstruct it byte-identically from the
+            // stored `last_consumer` / `last_payout` / `remaining_*`.
+            // The senior-engineer review of commit c86bcd8b validated
+            // these fields' consistency at deserialization time, so
+            // the unwraps below are infallible by invariant.
+            let last_consumer = lineage.last_consumer_account_id.ok_or(
+                PswapLineageError::InconsistentRow(alloc::string::String::from(
+                    "current_depth > 0 but last_consumer_account_id is NULL",
+                )),
+            )?;
+            let last_payout = lineage.last_payout_amount.ok_or(
+                PswapLineageError::InconsistentRow(alloc::string::String::from(
+                    "current_depth > 0 but last_payout_amount is NULL",
+                )),
+            )?;
+
+            lineage
+                .original_pswap
+                .remainder_note(
+                    last_consumer,
+                    lineage.current_depth,
+                    last_payout,
+                    lineage.remaining_offered,
+                    lineage.remaining_requested,
+                )
+                .map_err(PswapLineageError::Reconstruction)?
+        };
+
+        TransactionRequestBuilder::new()
+            .build_pswap_cancel(tip_note, lineage.creator_account_id())
+            .map_err(ClientError::TransactionRequestError)
+    }
+
+    /// Imports an existing PSWAP lineage created by an account on this
+    /// client *before chain tracking was enabled* (e.g. after a wallet
+    /// restore). Cold-start lineage discovery is not yet implemented —
+    /// see plan §11 for the deferred-to-v2 rationale.
+    pub async fn import_pswap_lineage(
+        &self,
+        _initial_note_id: NoteId,
+    ) -> Result<(), ClientError> {
+        Err(PswapLineageError::NotImplemented.into())
+    }
+}

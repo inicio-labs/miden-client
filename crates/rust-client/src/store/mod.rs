@@ -678,6 +678,50 @@ pub trait Store: Send + Sync {
         &self,
         account_id: AccountId,
     ) -> Result<Option<AccountRecord>, StoreError>;
+
+    // PSWAP LINEAGES
+    // --------------------------------------------------------------------------------------------
+
+    /// Persists a [`crate::pswap::PswapLineageRecord`]. Performs an UPSERT
+    /// on `order_id` so the call is safe to retry; existing rows are
+    /// overwritten in full. Callers should use this only at lineage
+    /// creation time — once a lineage is live, mutations go through
+    /// [`Self::apply_pswap_round`] instead.
+    async fn upsert_pswap_lineage(
+        &self,
+        record: &crate::pswap::PswapLineageRecord,
+    ) -> Result<(), StoreError>;
+
+    /// Returns the lineage row for `order_id`, or `None` if not tracked.
+    async fn get_pswap_lineage(
+        &self,
+        order_id: Felt,
+    ) -> Result<Option<crate::pswap::PswapLineageRecord>, StoreError>;
+
+    /// Lists lineage rows matching `filter`.
+    async fn list_pswap_lineages(
+        &self,
+        filter: crate::pswap::PswapLineageFilter,
+    ) -> Result<Vec<crate::pswap::PswapLineageRecord>, StoreError>;
+
+    /// Atomically advances a lineage by one round. Inside a single SQL
+    /// transaction the implementation MUST:
+    ///
+    /// 1. Update the matching `pswap_lineages` row — tip, depth,
+    ///    remaining_*, last_consumer / last_payout, state, updated_at_block.
+    /// 2. If `update.reconstructed_payback.is_some()`, insert that note
+    ///    into `input_notes` using `INSERT OR IGNORE` on the `note_id` PK
+    ///    so the default screener's earlier insertion (for *public*
+    ///    paybacks) is not duplicated.
+    ///
+    /// Returning before both steps commit leaves the lineage in an
+    /// observable half-applied state, so backends without genuine
+    /// transactions (e.g. an early WASM stub) MUST surface a clear error
+    /// rather than silently splitting the write.
+    async fn apply_pswap_round(
+        &self,
+        update: &crate::pswap::PswapLineageRoundUpdate,
+    ) -> Result<(), StoreError>;
 }
 
 // PARTIAL BLOCKCHAIN NODE FILTER

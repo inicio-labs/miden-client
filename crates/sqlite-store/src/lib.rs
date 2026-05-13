@@ -63,6 +63,7 @@ mod builder;
 mod chain_data;
 mod db_management;
 mod note;
+mod pswap;
 mod sql_error;
 mod sync;
 mod transaction;
@@ -564,6 +565,58 @@ impl Store for SqliteStore {
             SqliteStore::get_minimal_partial_account(conn, account_id)
         })
         .await
+    }
+
+    // PSWAP LINEAGES
+    // --------------------------------------------------------------------------------------------
+
+    async fn upsert_pswap_lineage(
+        &self,
+        record: &miden_client::pswap::PswapLineageRecord,
+    ) -> Result<(), StoreError> {
+        let record = record.clone();
+        self.interact_with_connection(move |conn| SqliteStore::upsert_pswap_lineage(conn, record))
+            .await
+    }
+
+    async fn get_pswap_lineage(
+        &self,
+        order_id: Felt,
+    ) -> Result<Option<miden_client::pswap::PswapLineageRecord>, StoreError> {
+        self.interact_with_connection(move |conn| SqliteStore::get_pswap_lineage(conn, order_id))
+            .await
+    }
+
+    async fn list_pswap_lineages(
+        &self,
+        filter: miden_client::pswap::PswapLineageFilter,
+    ) -> Result<Vec<miden_client::pswap::PswapLineageRecord>, StoreError> {
+        let by_creator = match &filter {
+            miden_client::pswap::PswapLineageFilter::ByCreator(id) => Some(*id),
+            _ => None,
+        };
+        let rows = self
+            .interact_with_connection(move |conn| SqliteStore::list_pswap_lineages(conn, filter))
+            .await?;
+
+        // The ByCreator filter cannot be expressed in SQL because the creator
+        // is embedded in the serialised `original_pswap` blob; apply it here.
+        Ok(match by_creator {
+            None => rows,
+            Some(account_id) => rows
+                .into_iter()
+                .filter(|r| r.creator_account_id() == account_id)
+                .collect(),
+        })
+    }
+
+    async fn apply_pswap_round(
+        &self,
+        update: &miden_client::pswap::PswapLineageRoundUpdate,
+    ) -> Result<(), StoreError> {
+        let update = update.clone();
+        self.interact_with_connection(move |conn| SqliteStore::apply_pswap_round(conn, update))
+            .await
     }
 }
 

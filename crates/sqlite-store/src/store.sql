@@ -251,3 +251,52 @@ CREATE TABLE addresses (
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_addresses_account_id ON addresses(account_id);
+
+-- ── PSWAP lineage tracking ───────────────────────────────────────────────
+--
+-- One row per PSWAP order created by an account this client tracks. The
+-- order is identified by `order_id = original_pswap.serial[1]`, which is
+-- stable across every fill round in the chain.
+--
+-- The `original_pswap` BLOB carries the serialised PswapNote that the
+-- creator emitted. Every "initial" field (creator/sender, offered &
+-- requested assets, serial number, note types) is derived on demand by
+-- deserialising this BLOB and calling the existing PswapNote getters.
+-- `order_id` is duplicated outside the BLOB as a primary key so the
+-- per-note observer can look it up without deserialising on every
+-- incoming chain note.
+--
+-- The mutable columns describe the live tip of the chain at any point:
+-- which note is at the head, how much of the offered / requested totals
+-- is still unfilled, and what depth we have advanced through. The
+-- `last_consumer_account_id` / `last_payout_amount` columns are needed
+-- to reconstruct the current tip via `PswapNote::remainder_note(...)`
+-- when the creator wants to reclaim a chain that has been partially
+-- filled by other accounts (the creator never originated the remainder,
+-- so we need enough information to rebuild it byte-identically).
+CREATE TABLE pswap_lineages (
+    order_id                  BLOB    NOT NULL,  -- Felt (8 bytes), == original_pswap.serial[1]
+    original_pswap            BLOB    NOT NULL,  -- serialised PswapNote (source of truth for every initial-* field)
+
+    -- Live tip state.
+    current_tip_note_id       TEXT    NOT NULL,
+    current_tip_nullifier     TEXT    NOT NULL,  -- hex; indexed for fast lookup during sync
+    current_depth             UNSIGNED BIG INT NOT NULL,  -- u64, 0 for the original tip
+    remaining_offered         UNSIGNED BIG INT NOT NULL,  -- u64
+    remaining_requested       UNSIGNED BIG INT NOT NULL,  -- u64
+
+    -- Reconstruction context for the current tip (NULL iff current_depth == 0,
+    -- because the original tip is owned by the creator and stored in
+    -- `output_notes` rather than reconstructed).
+    last_consumer_account_id  BLOB,                       -- AccountId (8 bytes)
+    last_payout_amount        UNSIGNED BIG INT,           -- u64 offered-asset units paid out in the most recent round
+
+    state                     UNSIGNED INT NOT NULL,      -- u8 PswapLineageState (Active=0, FullyFilled=1, Reclaimed=2)
+    created_at_block          UNSIGNED BIG INT NOT NULL,
+    updated_at_block          UNSIGNED BIG INT NOT NULL,
+
+    PRIMARY KEY (order_id)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_pswap_lineages_state          ON pswap_lineages(state);
+CREATE INDEX idx_pswap_lineages_tip_nullifier  ON pswap_lineages(current_tip_nullifier);

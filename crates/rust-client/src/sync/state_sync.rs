@@ -18,6 +18,7 @@ use miden_protocol::crypto::merkle::mmr::{MmrDelta, PartialMmr};
 use miden_protocol::note::{Note, NoteAttachments, NoteId, NoteTag, NoteType, Nullifier};
 use tracing::info;
 
+use super::NoteObserver;
 use super::state_sync_update::TransactionUpdateTracker;
 use super::{
     AccountUpdates,
@@ -169,6 +170,12 @@ pub struct StateSync {
     /// Responsible for checking the relevance of notes and executing the
     /// [`OnNoteReceived`] callback when a new note inclusion is received.
     note_screener: Arc<dyn OnNoteReceived>,
+    /// Side-effect-only per-note observers (see [`NoteObserver`]). Fanned
+    /// out alongside the screener verdict inside `note_state_sync`.
+    /// Errors are logged via `tracing::warn!` and do not abort sync.
+    /// Empty by default; populated by callers via
+    /// [`Self::with_note_observer`].
+    note_observers: Vec<Arc<dyn NoteObserver>>,
     /// Number of blocks after which pending transactions are considered stale and discarded.
     /// If `None`, there is no limit and transactions will be kept indefinitely.
     tx_discard_delta: Option<u32>,
@@ -197,9 +204,27 @@ impl StateSync {
         Self {
             rpc_api,
             note_screener,
+            note_observers: Vec::new(),
             tx_discard_delta,
             sync_nullifiers: true,
         }
+    }
+
+    /// Attaches a [`NoteObserver`] to this sync component.
+    ///
+    /// Observers run in attachment order after the screener verdict for
+    /// each note. Errors returned from
+    /// [`NoteObserver::observe`](crate::sync::NoteObserver::observe) are
+    /// logged via `tracing::warn!` (tagged with the observer's
+    /// [`name`](crate::sync::NoteObserver::name)) and never abort sync.
+    ///
+    /// Several observers may be attached to the same `StateSync`; each
+    /// is invoked independently and ordering between observers is not
+    /// guaranteed beyond attachment order.
+    #[must_use]
+    pub fn with_note_observer(mut self, observer: Arc<dyn NoteObserver>) -> Self {
+        self.note_observers.push(observer);
+        self
     }
 
     /// Disables the nullifier sync.
@@ -843,6 +868,19 @@ impl StateSync {
                 .flatten()
                 .cloned();
 
+            // The screener consumes `committed_note` by value (it threads
+            // the note back through `NoteUpdateAction::Commit(...)`).
+            // Observers need their own handle since they may run after a
+            // `Discard` verdict that drops the note entirely. Clone once
+            // here; `CommittedNote` is cheap to clone (metadata + ids,
+            // not full note bodies). If `note_observers` is empty (the
+            // common case for clients with no PSWAP / dApp features
+            // attached), the clone is wasted but the alternative —
+            // duplicating the loop body across "has observers" /
+            // "doesn't" — would be uglier.
+            let note_for_observers = (!self.note_observers.is_empty())
+                .then(|| committed_note.clone());
+
             match self.note_screener.on_note_received(committed_note, public_note).await? {
                 NoteUpdateAction::Commit(committed_note) => {
                     // Only mark the downloaded block header as relevant if we are talking about
@@ -861,6 +899,22 @@ impl StateSync {
                     note_updates.apply_new_public_note(public_note, block_header)?;
                 },
                 NoteUpdateAction::Discard => {},
+            }
+
+            // Fan out to observers after the screener has decided. Errors
+            // are logged via tracing and never abort sync (see
+            // `NoteObserver` trait doc). Observers run in attachment
+            // order; ordering between them is not part of the contract.
+            if let Some(note_for_observers) = note_for_observers {
+                for obs in &self.note_observers {
+                    if let Err(err) = obs.observe(&note_for_observers).await {
+                        tracing::warn!(
+                            observer = obs.name(),
+                            error = ?err,
+                            "note observer failed; sync continues",
+                        );
+                    }
+                }
             }
         }
 

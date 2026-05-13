@@ -76,6 +76,9 @@ mod block_header;
 mod tag;
 pub use tag::{NoteTagRecord, NoteTagSource};
 
+mod note_observer;
+pub use note_observer::NoteObserver;
+
 mod state_sync;
 pub use state_sync::{
     AccountSyncHint,

@@ -17,6 +17,7 @@ use miden_client::pswap::{
     lineage::build_record_from_columns,
 };
 use miden_client::store::StoreError;
+use miden_client::sync::{NoteTagRecord, NoteTagSource};
 use miden_client::utils::{Deserializable, DeserializationError, Serializable};
 use miden_protocol::Felt;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
@@ -24,6 +25,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use super::SqliteStore;
 use crate::note::upsert_input_note_tx;
 use crate::sql_error::SqlResultExt;
+use crate::sync::remove_note_tag_tx;
 
 impl SqliteStore {
     // ---------------------------------------------------------------------------------------
@@ -109,8 +111,63 @@ impl SqliteStore {
             )?;
         }
 
+        // 3. Terminal-state tag cleanup. The asset-pair tag registered at
+        //    lineage creation (see `Client::record_created_pswap_lineages`)
+        //    keeps sync fetching notes for the pair on this client's
+        //    behalf. Once the lineage is `FullyFilled` or `Reclaimed` we
+        //    no longer want those notes — drop the tag in the same
+        //    transaction so a crash between the lineage update and the
+        //    tag delete cannot leave us with a terminal lineage that is
+        //    still paying sync bandwidth.
+        if matches!(
+            update.new_state,
+            PswapLineageState::FullyFilled | PswapLineageState::Reclaimed
+        ) {
+            remove_pswap_asset_pair_tag_tx(&tx, update.order_id)?;
+        }
+
         tx.commit().into_store_error()
     }
+}
+
+/// Removes the `(asset_pair_tag, PswapAssetPair(order_id))` row in `tags`
+/// for the given lineage. Deserialises the row's `original_pswap` to
+/// recompute the tag — the round update does not carry it.
+///
+/// Idempotent: returns `Ok(())` when no row matches (e.g. the tag was
+/// already removed by a previous terminal transition that crashed
+/// post-commit, or never inserted because the lineage predates the
+/// tag-registration code path).
+fn remove_pswap_asset_pair_tag_tx(
+    tx: &Transaction<'_>,
+    order_id: Felt,
+) -> Result<(), StoreError> {
+    const SQL: &str = "SELECT original_pswap FROM pswap_lineages WHERE order_id = ?";
+    let blob: Option<Vec<u8>> = tx
+        .prepare_cached(SQL)
+        .into_store_error()?
+        .query_row(params![order_id.to_bytes()], |row| row.get(0))
+        .optional()
+        .into_store_error()?;
+    let Some(blob) = blob else {
+        return Ok(());
+    };
+
+    let note =
+        Note::read_from_bytes(&blob).map_err(StoreError::DataDeserializationError)?;
+    let pswap = PswapNote::try_from(&note)
+        .map_err(|err| StoreError::DataDeserializationError(deser_err(err.to_string())))?;
+    let tag = PswapNote::create_tag(
+        pswap.note_type(),
+        pswap.offered_asset(),
+        pswap.storage().requested_asset(),
+    );
+
+    remove_note_tag_tx(
+        tx,
+        NoteTagRecord { tag, source: NoteTagSource::PswapAssetPair(order_id) },
+    )?;
+    Ok(())
 }
 
 // -------------------------------------------------------------------------------------------

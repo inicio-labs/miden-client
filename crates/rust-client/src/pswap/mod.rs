@@ -52,3 +52,120 @@ pub mod observer;
 pub use errors::PswapLineageError;
 pub use lineage::{PswapLineageFilter, PswapLineageRecord, PswapLineageRoundUpdate, PswapLineageState};
 pub use observer::{PswapChainNoteUpdate, PswapChainObserver};
+
+use alloc::collections::BTreeSet;
+
+use miden_protocol::block::BlockNumber;
+use miden_protocol::note::{Note, NoteType};
+use miden_standards::note::PswapNote;
+use miden_tx::auth::TransactionAuthenticator;
+use tracing::warn;
+
+use crate::ClientError;
+use crate::sync::{NoteTagRecord, NoteTagSource};
+use crate::transaction::TransactionResult;
+use crate::{Client, transaction::notes_from_output};
+
+impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
+    /// Records any new PSWAP orders this transaction created as
+    /// [`PswapLineageRecord`] rows in the store, and registers the
+    /// matching asset-pair tag so future remainders are delivered via
+    /// sync.
+    ///
+    /// Called by `apply_transaction_update` immediately after the
+    /// transaction has been persisted to the store. Idempotent: an
+    /// upsert on `order_id` plus a tag-source insert that's also
+    /// idempotent on its `(tag, source)` row. Safe to retry; safe to
+    /// no-op (the common case — the transaction is not a
+    /// `build_pswap_create`).
+    ///
+    /// ### Filter criteria
+    ///
+    /// An output note becomes a tracked lineage iff all of:
+    ///   * `PswapNote::try_from(&note)` succeeds — the note is a PSWAP
+    ///     (this is cheap and fails fast for non-PSWAP outputs),
+    ///   * `pswap.parent_depth() == 0` — it's the originating order,
+    ///     not a remainder this client happened to emit while filling
+    ///     someone else's PSWAP,
+    ///   * `pswap.storage().creator_account_id()` is in
+    ///     `store.get_account_ids()` — the creator is a local
+    ///     account; we don't track orders for foreign creators.
+    ///
+    /// Multiple PSWAP creates in a single transaction (unusual but not
+    /// prohibited by protocol) produce one row each.
+    pub(crate) async fn record_created_pswap_lineages(
+        &self,
+        tx_result: &TransactionResult,
+        submission_height: BlockNumber,
+    ) -> Result<(), ClientError> {
+        let output_notes = tx_result.executed_transaction().output_notes();
+        let tracked_account_ids: BTreeSet<_> =
+            self.store.get_account_ids().await?.into_iter().collect();
+
+        for note in notes_from_output(output_notes) {
+            let Ok(pswap) = PswapNote::try_from(note) else {
+                continue;
+            };
+
+            if pswap.parent_depth() != 0 {
+                continue;
+            }
+
+            let creator = pswap.storage().creator_account_id();
+            if !tracked_account_ids.contains(&creator) {
+                continue;
+            }
+
+            // Private PSWAPs are tracked the same way as public ones —
+            // the attachment side-channel (commits earlier on this
+            // branch) makes the chain readable for both types as long
+            // as the chain itself is public (i.e. `note_type` is
+            // Public). Private originals with private remainders are
+            // accepted with a `tracing::warn!` so the operator sees
+            // them in logs; the correlator will simply not advance
+            // them because the attachment word never reaches the
+            // observer for private outputs. Documented limitation in
+            // the plan §6.0.
+            if pswap.note_type() == NoteType::Private {
+                warn!(
+                    order_id = %pswap.order_id().as_canonical_u64(),
+                    "creating lineage for private PSWAP; chain progress will not be tracked \
+                     until the protocol exposes private-note attachment content via sync",
+                );
+            }
+
+            let record = build_initial_lineage_record(note, &pswap, submission_height);
+            let asset_pair_tag = record.asset_pair_tag();
+            let order_id = record.order_id();
+
+            self.store.upsert_pswap_lineage(&record).await?;
+            self.insert_note_tag(NoteTagRecord {
+                tag: asset_pair_tag,
+                source: NoteTagSource::PswapAssetPair(order_id),
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+}
+
+fn build_initial_lineage_record(
+    note: &Note,
+    pswap: &PswapNote,
+    submission_height: BlockNumber,
+) -> PswapLineageRecord {
+    PswapLineageRecord {
+        original_pswap: pswap.clone(),
+        current_tip_note_id: note.id(),
+        current_tip_nullifier: note.nullifier(),
+        current_depth: 0,
+        remaining_offered: pswap.offered_asset().amount(),
+        remaining_requested: pswap.storage().requested_asset_amount(),
+        last_consumer_account_id: None,
+        last_payout_amount: None,
+        state: PswapLineageState::Active,
+        created_at_block: submission_height,
+        updated_at_block: submission_height,
+    }
+}

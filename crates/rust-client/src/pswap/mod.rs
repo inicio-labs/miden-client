@@ -178,7 +178,6 @@ use alloc::vec::Vec;
 
 use miden_protocol::Felt;
 use miden_protocol::account::AccountId;
-use miden_protocol::note::NoteId;
 
 use crate::store::NoteFilter;
 use crate::transaction::{TransactionRequest, TransactionRequestBuilder};
@@ -290,14 +289,4 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             .map_err(ClientError::TransactionRequestError)
     }
 
-    /// Imports an existing PSWAP lineage created by an account on this
-    /// client *before chain tracking was enabled* (e.g. after a wallet
-    /// restore). Cold-start lineage discovery is not yet implemented —
-    /// see plan §11 for the deferred-to-v2 rationale.
-    pub async fn import_pswap_lineage(
-        &self,
-        _initial_note_id: NoteId,
-    ) -> Result<(), ClientError> {
-        Err(PswapLineageError::NotImplemented.into())
-    }
 }

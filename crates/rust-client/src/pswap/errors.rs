@@ -78,12 +78,6 @@ pub enum PswapLineageError {
     #[error("PSWAP lineage row is internally inconsistent: {0}")]
     InconsistentRow(String),
 
-    /// Reserved for the v2 cold-start `import_pswap_lineage` API. The v1
-    /// implementation returns this from the stub so callers learn the API
-    /// exists but is not yet functional.
-    #[error("PSWAP chain tracking does not yet support importing a lineage from on-chain data")]
-    NotImplemented,
-
     /// Propagated from the store layer. Kept as a distinct variant rather
     /// than collapsing into `ClientError` so callers can match specifically
     /// on PSWAP store failures.

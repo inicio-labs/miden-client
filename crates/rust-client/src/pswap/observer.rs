@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use miden_protocol::Felt;
 use miden_protocol::account::AccountId;
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::NoteId;
+use miden_protocol::note::{NoteId, NoteInclusionProof};
 use miden_standards::note::PswapNote;
 
 use crate::ClientError;
@@ -55,6 +55,14 @@ pub struct PswapChainNoteUpdate {
     pub sender: AccountId,
     /// Block number the note was committed in.
     pub block: BlockNumber,
+    /// Inclusion proof for the note in the block. Captured here so the
+    /// post-sync correlator can hand it to the store when inserting
+    /// the reconstructed payback into `input_notes` — without it, the
+    /// payback would land in `Expected` state with no way to advance
+    /// to `Committed` (the default `NoteScreener` Discards private
+    /// notes it does not already track, so the inclusion proof would
+    /// never reach the screener's state-promotion path).
+    pub inclusion_proof: NoteInclusionProof,
 }
 
 // PSWAP CHAIN OBSERVER
@@ -134,13 +142,15 @@ impl NoteObserver for PswapChainObserver {
         // 4. Record. The correlator drains this after
         //    `StateSync::sync_state` returns and decides per-note role
         //    (payback vs remainder) via reconstruction.
+        let inclusion_proof = committed_note.inclusion_proof().clone();
         let update = PswapChainNoteUpdate {
             note_id: *committed_note.note_id(),
             order_id,
             depth,
             amount,
             sender: committed_note.sender(),
-            block: committed_note.inclusion_proof().location().block_num(),
+            block: inclusion_proof.location().block_num(),
+            inclusion_proof,
         };
 
         self.chain_note_updates.write().push(update);

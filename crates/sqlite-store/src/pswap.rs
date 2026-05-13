@@ -97,9 +97,16 @@ impl SqliteStore {
         //    upsert routes through INSERT OR REPLACE keyed by `note_id` so
         //    the default `NoteScreener`'s prior insertion for a public
         //    payback is not duplicated; for a private payback this is the
-        //    only insertion site.
+        //    only insertion site, and the included inclusion proof makes
+        //    the row directly consumable (see
+        //    `insert_reconstructed_payback_tx`).
         if let Some(payback_note) = &update.reconstructed_payback {
-            insert_reconstructed_payback_tx(&tx, payback_note, update.at_block)?;
+            insert_reconstructed_payback_tx(
+                &tx,
+                payback_note,
+                update.reconstructed_payback_inclusion_proof.as_ref(),
+                update.at_block,
+            )?;
         }
 
         tx.commit().into_store_error()
@@ -323,10 +330,11 @@ WHERE order_id = ?";
 fn insert_reconstructed_payback_tx(
     tx: &Transaction<'_>,
     payback_note: &Note,
+    inclusion_proof: Option<&miden_client::note::NoteInclusionProof>,
     at_block: BlockNumber,
 ) -> Result<(), StoreError> {
     use miden_client::store::InputNoteRecord;
-    use miden_client::store::input_note_states::ExpectedNoteState;
+    use miden_client::store::input_note_states::{ExpectedNoteState, UnverifiedNoteState};
 
     // IDEMPOTENT INSERT (the trait doc says "INSERT OR IGNORE"). For a
     // *public* payback the default `NoteScreener` will already have
@@ -334,13 +342,14 @@ fn insert_reconstructed_payback_tx(
     // sync round, with a valid inclusion proof. The downstream
     // `upsert_input_note_tx` is `INSERT OR REPLACE`, so calling it
     // unconditionally here would downgrade the screener's `Committed`
-    // row back to `Expected` (no proof) — the note would not be
-    // consumable until the next sync re-upgraded it.
+    // row back to `Expected` / `Unverified` (no proof) — the note
+    // would not be consumable until the next sync re-upgraded it.
     //
     // The right semantics is "skip if a row already exists for this
-    // note_id." For a private payback the screener Discards and there is
-    // no prior row, so this is the only insertion site. For a public
-    // payback the screener's row is already richer than ours; leave it.
+    // note_id." For a private payback the screener Discards and there
+    // is no prior row, so this is the only insertion site. For a
+    // public payback the screener's row is already richer than ours;
+    // leave it.
     let note_id_text = payback_note.id().as_word().to_string();
     const EXISTS_SQL: &str = "SELECT 1 FROM input_notes WHERE note_id = ?";
     let already_present: bool = tx
@@ -354,12 +363,33 @@ fn insert_reconstructed_payback_tx(
 
     let metadata = payback_note.metadata().clone();
     let details = miden_client::note::NoteDetails::from(payback_note.clone());
-    let state = ExpectedNoteState {
-        metadata: Some(metadata.clone()),
-        after_block_num: at_block,
-        tag: Some(metadata.tag()),
+
+    // Prefer `Unverified` state — it carries the inclusion proof, which
+    // the sync state-promotion path turns into `Committed` on the next
+    // run without needing to re-fetch the note from the node. Falls
+    // back to `Expected` only if the correlator could not supply a
+    // proof (reclaim rounds emit no payback, so this branch is
+    // currently unreachable in practice, but the fallback keeps the
+    // function total).
+    let record = match inclusion_proof {
+        Some(proof) => InputNoteRecord::new(
+            details,
+            None,
+            UnverifiedNoteState {
+                metadata,
+                inclusion_proof: proof.clone(),
+            }
+            .into(),
+        ),
+        None => {
+            let state = ExpectedNoteState {
+                metadata: Some(metadata.clone()),
+                after_block_num: at_block,
+                tag: Some(metadata.tag()),
+            };
+            InputNoteRecord::new(details, None, state.into())
+        },
     };
-    let record = InputNoteRecord::new(details, None, state.into());
     upsert_input_note_tx(tx, &record)
 }
 
@@ -513,6 +543,7 @@ mod tests {
             new_tip_nullifier: Some(record.current_tip_nullifier),
             at_block: BlockNumber::from(8),
             reconstructed_payback: None,
+            reconstructed_payback_inclusion_proof: None,
             reconstructed_remainder: None,
         };
         let result = store.apply_pswap_round(&bad).await;
@@ -553,6 +584,7 @@ mod tests {
             new_tip_nullifier: None,
             at_block: BlockNumber::from(8),
             reconstructed_payback: None,
+            reconstructed_payback_inclusion_proof: None,
             reconstructed_remainder: None,
         };
         let result = store.apply_pswap_round(&bogus).await;

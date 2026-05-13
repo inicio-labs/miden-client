@@ -9,7 +9,7 @@ use miden_protocol::Word;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{Note, NoteId, NoteTag, NoteType, Nullifier};
+use miden_protocol::note::{Note, NoteId, NoteInclusionProof, NoteTag, NoteType, Nullifier};
 use miden_standards::note::PswapNote;
 
 use super::errors::PswapLineageError;
@@ -235,6 +235,18 @@ pub struct PswapLineageRoundUpdate {
     /// (idempotent on `note_id` PK) so the creator's normal consume flow
     /// finds it. `None` only on a reclaim, where no payback is emitted.
     pub reconstructed_payback: Option<Note>,
+    /// Inclusion proof of the payback note in the block where it was
+    /// emitted. Threaded all the way from
+    /// `PswapChainObserver::observe` (which captures it from the
+    /// `CommittedNote` it sees during sync) so the store can insert
+    /// the reconstructed payback in `Unverified` state — ready for
+    /// the normal sync state-promotion path. Without it the payback
+    /// would land in `Expected` state forever, since the default
+    /// `NoteScreener` Discards private notes it does not already
+    /// track and so never sees the payback again on a subsequent sync.
+    /// `None` exactly when `reconstructed_payback.is_none()` —
+    /// i.e. for reclaim rounds.
+    pub reconstructed_payback_inclusion_proof: Option<NoteInclusionProof>,
     /// Reconstructed remainder note built via [`PswapNote::remainder_note`].
     /// The correlator verified its `note_id` matched. `None` on terminal
     /// states. Retained for diagnostics; not persisted directly.

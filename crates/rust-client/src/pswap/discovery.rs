@@ -176,6 +176,7 @@ fn build_round_update(
                 new_tip_nullifier: None,
                 at_block: block,
                 reconstructed_payback: None,
+                reconstructed_payback_inclusion_proof: None,
                 reconstructed_remainder: None,
             }))
         },
@@ -201,6 +202,7 @@ fn build_round_update(
                 new_tip_nullifier: None,
                 at_block: block,
                 reconstructed_payback: Some(payback),
+                reconstructed_payback_inclusion_proof: Some(candidate.inclusion_proof.clone()),
                 reconstructed_remainder: None,
             }))
         },
@@ -262,6 +264,7 @@ fn build_round_update(
                 new_tip_nullifier: Some(new_tip_nullifier),
                 at_block: block,
                 reconstructed_payback: Some(payback_note),
+                reconstructed_payback_inclusion_proof: Some(payback_cand.inclusion_proof.clone()),
                 reconstructed_remainder: Some(remainder_note),
             }))
         },

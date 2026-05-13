@@ -56,10 +56,9 @@ pub use observer::{PswapChainNoteUpdate, PswapChainObserver};
 use alloc::collections::BTreeSet;
 
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{Note, NoteType};
+use miden_protocol::note::Note;
 use miden_standards::note::PswapNote;
 use miden_tx::auth::TransactionAuthenticator;
-use tracing::warn;
 
 use crate::ClientError;
 use crate::sync::{NoteTagRecord, NoteTagSource};
@@ -116,23 +115,15 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
                 continue;
             }
 
-            // Private PSWAPs are tracked the same way as public ones —
-            // the attachment side-channel (commits earlier on this
-            // branch) makes the chain readable for both types as long
-            // as the chain itself is public (i.e. `note_type` is
-            // Public). Private originals with private remainders are
-            // accepted with a `tracing::warn!` so the operator sees
-            // them in logs; the correlator will simply not advance
-            // them because the attachment word never reaches the
-            // observer for private outputs. Documented limitation in
-            // the plan §6.0.
-            if pswap.note_type() == NoteType::Private {
-                warn!(
-                    order_id = %pswap.order_id().as_canonical_u64(),
-                    "creating lineage for private PSWAP; chain progress will not be tracked \
-                     until the protocol exposes private-note attachment content via sync",
-                );
-            }
+            // Private PSWAPs are tracked the same way as public ones.
+            // The `NoteAttachment` is the protocol's *explicit* public
+            // sidecar for private notes (see
+            // `miden_protocol::note::NoteAttachment` doc, "An
+            // attachment is a _public_ extension to a note"), and the
+            // adapter commit `d2cddf8f` threads the deserialised
+            // `NoteAttachments` through `CommittedNote` so the
+            // observer reads `attachment_word[0]` regardless of
+            // note_type. No special-case warning is needed.
 
             let record = build_initial_lineage_record(note, &pswap, submission_height);
             let asset_pair_tag = record.asset_pair_tag();

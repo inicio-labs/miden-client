@@ -43,6 +43,22 @@ pub struct StateSyncUpdate {
     pub transaction_updates: TransactionUpdateTracker,
     /// Public account updates and mismatched private accounts after the sync.
     pub account_updates: AccountUpdates,
+    /// Nullifiers consumed during this sync window, each tagged with the
+    /// block in which the consumption was observed.
+    ///
+    /// Populated by `StateSync::nullifiers_state_sync` for every
+    /// `NullifierUpdate` returned by the node's `sync_nullifiers`
+    /// endpoint. Used by post-sync consumers that need to correlate a
+    /// consumption event with other per-block data — most notably the
+    /// PSWAP chain-tracking correlator
+    /// (`crate::pswap::discovery::discover_pswap_rounds`), which joins
+    /// this list against the per-sync `PswapChainNoteUpdate` collector
+    /// to advance each tracked lineage.
+    ///
+    /// Empty for sync rounds where the node returned no nullifier
+    /// updates, including all rounds when nullifier sync is disabled
+    /// via `StateSync::disable_nullifier_sync`.
+    pub current_window_nullifier_blocks: Vec<(Nullifier, BlockNumber)>,
 }
 
 impl From<&StateSyncUpdate> for SyncSummary {

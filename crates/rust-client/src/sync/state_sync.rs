@@ -975,6 +975,14 @@ impl StateSync {
             state_sync_update
                 .transaction_updates
                 .apply_input_note_nullified(consumption.nullifier);
+
+            // Record the (nullifier, block) pair for downstream consumers
+            // that need to correlate a consumption event with other
+            // per-block sync data — see
+            // `StateSyncUpdate::current_window_nullifier_blocks` doc.
+            state_sync_update
+                .current_window_nullifier_blocks
+                .push((consumption.nullifier, consumption.block_num));
         }
 
         Ok(())

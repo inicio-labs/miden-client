@@ -114,6 +114,10 @@ impl SqliteStore {
             note_updates,
             transaction_updates,
             account_updates,
+            // The nullifier-window list is consumed in `Client::sync_state`
+            // by the PSWAP correlator before this method is called, so
+            // there is nothing for the store to persist from it.
+            current_window_nullifier_blocks: _,
         } = state_sync_update;
 
         let tx = conn.transaction().into_store_error()?;

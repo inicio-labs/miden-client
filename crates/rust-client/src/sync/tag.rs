@@ -153,6 +153,75 @@ impl Deserializable for NoteTagSource {
     }
 }
 
+#[cfg(test)]
+mod tag_source_tests {
+    use miden_protocol::Felt;
+    use miden_protocol::testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET;
+
+    use super::{Deserializable, NoteTagSource, Serializable};
+
+    /// `NoteTagSource` is serialised into the on-disk `tags.source` BLOB
+    /// column. The wire encoding starts with a `u8` discriminant —
+    /// stability of those values is part of the persisted-format
+    /// contract. This test pins the discriminants explicitly so a
+    /// renumber would fail it before any user upgrades a wallet to a
+    /// version with shifted bytes.
+    #[test]
+    fn note_tag_source_discriminants_are_stable() {
+        let cases = [
+            (NoteTagSource::User, 2u8),
+            (NoteTagSource::PswapAssetPair(Felt::new(42)), 3u8),
+        ];
+        for (variant, expected_disc) in cases {
+            let bytes = variant.to_bytes();
+            assert_eq!(
+                bytes[0], expected_disc,
+                "variant {variant:?} expected discriminant {expected_disc}, got {}",
+                bytes[0],
+            );
+        }
+    }
+
+    /// Round-trip every variant. Backward-compatibility check: even when
+    /// the `PswapAssetPair` discriminant (3) is added, the existing
+    /// `Account` / `Note` / `User` variants must continue to round-trip
+    /// unchanged.
+    #[test]
+    fn note_tag_source_round_trip_every_variant() {
+        let account_id =
+            miden_protocol::account::AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+        // Build a stable NoteId by hashing a known word pair — the exact
+        // shape doesn't matter, only that the round-trip preserves it.
+        let note_id = miden_protocol::note::NoteId::new(
+            miden_protocol::Word::empty(),
+            miden_protocol::Word::empty(),
+        );
+        let order_id = Felt::new(0xDEAD_BEEF_DEAD_BEEF);
+
+        let variants = [
+            NoteTagSource::Account(account_id),
+            NoteTagSource::Note(note_id),
+            NoteTagSource::User,
+            NoteTagSource::PswapAssetPair(order_id),
+        ];
+
+        for v in variants {
+            let bytes = v.to_bytes();
+            let decoded = NoteTagSource::read_from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, v, "round-trip failed for {v:?}");
+        }
+    }
+
+    /// Deserialising an unknown discriminant must error rather than
+    /// silently mapping to a known variant — defends against a future
+    /// version writing a byte we don't understand.
+    #[test]
+    fn note_tag_source_unknown_discriminant_errors() {
+        let bogus = [99u8];
+        assert!(NoteTagSource::read_from_bytes(&bogus).is_err());
+    }
+}
+
 impl PartialEq<NoteTag> for NoteTagRecord {
     fn eq(&self, other: &NoteTag) -> bool {
         self.tag == *other

@@ -265,6 +265,7 @@ pub enum PswapLineageFilter {
 ///
 /// Kept in the rust-client crate (rather than the SQLite store crate) so
 /// alternative backends can reuse the parsing logic.
+#[cfg_attr(any(test, feature = "testing"), allow(clippy::too_many_arguments))]
 pub fn build_record_from_columns(
     original_pswap: PswapNote,
     current_tip_note_id: NoteId,
@@ -302,5 +303,291 @@ pub fn build_record_from_columns(
         created_at_block,
         updated_at_block,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    //! Small synthetic-PSWAP factory shared by the lineage / observer /
+    //! discovery / store tests. Kept in `pub(crate)` so each module can
+    //! import without re-deriving the boilerplate.
+
+    use miden_protocol::Word;
+    use miden_protocol::account::AccountId;
+    use miden_protocol::asset::FungibleAsset;
+    use miden_protocol::note::NoteType;
+    use miden_protocol::testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+    };
+    use miden_standards::note::{PswapNote, PswapNoteStorage};
+
+    /// Returns `(sender, creator, offered_faucet, requested_faucet)` —
+    /// four distinct testing AccountIds chosen to satisfy PSWAP's
+    /// faucet-distinctness invariant.
+    pub fn fixed_account_ids() -> (AccountId, AccountId, AccountId, AccountId) {
+        (
+            AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap(),
+            AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2).unwrap(),
+            AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap(),
+            AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap(),
+        )
+    }
+
+    /// Builds a fully-formed [`PswapNote`] for use in tests. Defaults:
+    /// public note type, 100-unit offered, 50-unit requested, serial
+    /// number `[1, 2, 3, 4]`. Override via the params.
+    pub fn build_test_pswap(
+        sender: AccountId,
+        creator: AccountId,
+        offered_faucet: AccountId,
+        offered_amount: u64,
+        requested_faucet: AccountId,
+        requested_amount: u64,
+    ) -> PswapNote {
+        let offered = FungibleAsset::new(offered_faucet, offered_amount).unwrap();
+        let requested = FungibleAsset::new(requested_faucet, requested_amount).unwrap();
+        let storage = PswapNoteStorage::builder()
+            .requested_asset(requested)
+            .creator_account_id(creator)
+            .build();
+        PswapNote::builder()
+            .sender(sender)
+            .storage(storage)
+            .serial_number(Word::from([
+                miden_protocol::Felt::new(1),
+                miden_protocol::Felt::new(2),
+                miden_protocol::Felt::new(3),
+                miden_protocol::Felt::new(4),
+            ]))
+            .note_type(NoteType::Public)
+            .offered_asset(offered)
+            .build()
+            .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use miden_protocol::Word;
+
+    use super::test_helpers::{build_test_pswap, fixed_account_ids};
+    use super::*;
+
+    /// Stable byte encoding of `PswapLineageState`. The values are
+    /// persisted in the `pswap_lineages.state` SQL column; reordering
+    /// would silently corrupt existing databases.
+    #[test]
+    fn state_byte_encoding_is_stable() {
+        assert_eq!(PswapLineageState::Active.as_u8(), 0);
+        assert_eq!(PswapLineageState::FullyFilled.as_u8(), 1);
+        assert_eq!(PswapLineageState::Reclaimed.as_u8(), 2);
+    }
+
+    /// Round-trip every state via `try_from_u8`. Belt-and-suspenders
+    /// against a future renumbering breaking the on-disk format.
+    #[test]
+    fn state_try_from_u8_round_trips_known_variants() {
+        for state in
+            [PswapLineageState::Active, PswapLineageState::FullyFilled, PswapLineageState::Reclaimed]
+        {
+            assert_eq!(PswapLineageState::try_from_u8(state.as_u8()).unwrap(), state);
+        }
+    }
+
+    /// Unknown discriminants must error — defends against a future
+    /// store reading a forward-incompatible byte.
+    #[test]
+    fn state_try_from_u8_rejects_unknown() {
+        match PswapLineageState::try_from_u8(99) {
+            Err(PswapLineageError::UnknownState(99)) => {},
+            other => panic!("expected UnknownState(99), got {other:?}"),
+        }
+    }
+
+    /// Happy path for `build_record_from_columns` at depth 0 — both
+    /// `last_*` columns are `None`, every field carries through.
+    #[test]
+    fn build_record_from_columns_accepts_valid_depth_zero_row() {
+        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let pswap =
+            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let initial_note_id = miden_protocol::note::Note::from(pswap.clone()).id();
+        let nullifier = miden_protocol::note::Note::from(pswap.clone()).nullifier();
+
+        let record = build_record_from_columns(
+            pswap,
+            initial_note_id,
+            nullifier,
+            0,
+            100,
+            50,
+            None,
+            None,
+            PswapLineageState::Active.as_u8(),
+            BlockNumber::from(7),
+            BlockNumber::from(7),
+        )
+        .unwrap();
+
+        assert_eq!(record.current_depth, 0);
+        assert_eq!(record.remaining_offered, 100);
+        assert_eq!(record.remaining_requested, 50);
+        assert!(record.last_consumer_account_id.is_none());
+        assert!(record.last_payout_amount.is_none());
+        assert_eq!(record.state, PswapLineageState::Active);
+    }
+
+    /// Happy path at `current_depth > 0` — both `last_*` columns MUST
+    /// be populated.
+    #[test]
+    fn build_record_from_columns_accepts_valid_advanced_row() {
+        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let consumer = sender; // any non-creator account; reuse for brevity
+        let pswap =
+            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let note = miden_protocol::note::Note::from(pswap.clone());
+        let record = build_record_from_columns(
+            pswap,
+            note.id(),
+            note.nullifier(),
+            3,
+            70,
+            35,
+            Some(consumer),
+            Some(20),
+            PswapLineageState::Active.as_u8(),
+            BlockNumber::from(7),
+            BlockNumber::from(12),
+        )
+        .unwrap();
+
+        assert_eq!(record.last_consumer_account_id, Some(consumer));
+        assert_eq!(record.last_payout_amount, Some(20));
+    }
+
+    /// `current_depth == 0` with a populated `last_consumer` is the
+    /// classic inconsistency that breaks `remainder_note` reconstruction
+    /// (it implies a foreign account consumed the original PSWAP but we
+    /// somehow have round-0 state). Must surface as `InconsistentRow`.
+    #[test]
+    fn build_record_from_columns_rejects_depth_zero_with_last_consumer() {
+        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let pswap =
+            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let note = miden_protocol::note::Note::from(pswap.clone());
+        match build_record_from_columns(
+            pswap,
+            note.id(),
+            note.nullifier(),
+            0,
+            100,
+            50,
+            Some(sender), // ← inconsistent: depth 0 but last_consumer set
+            None,
+            PswapLineageState::Active.as_u8(),
+            BlockNumber::from(0),
+            BlockNumber::from(0),
+        ) {
+            Err(PswapLineageError::InconsistentRow(_)) => {},
+            other => panic!("expected InconsistentRow, got {other:?}"),
+        }
+    }
+
+    /// `current_depth > 0` with `last_payout_amount` NULL breaks the
+    /// remainder reconstruction path used by reclaim. Must surface as
+    /// `InconsistentRow`.
+    #[test]
+    fn build_record_from_columns_rejects_advanced_depth_without_last_payout() {
+        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let pswap =
+            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let note = miden_protocol::note::Note::from(pswap.clone());
+        match build_record_from_columns(
+            pswap,
+            note.id(),
+            note.nullifier(),
+            1,
+            50,
+            25,
+            Some(sender),
+            None, // ← inconsistent: depth > 0 but last_payout NULL
+            PswapLineageState::Active.as_u8(),
+            BlockNumber::from(0),
+            BlockNumber::from(0),
+        ) {
+            Err(PswapLineageError::InconsistentRow(_)) => {},
+            other => panic!("expected InconsistentRow, got {other:?}"),
+        }
+    }
+
+    /// Unknown state discriminant in the row bubbles up as
+    /// `UnknownState`. Reused: the same validation also covers schema-
+    /// drift defense for the `state` column.
+    #[test]
+    fn build_record_from_columns_rejects_unknown_state() {
+        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let pswap =
+            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let note = miden_protocol::note::Note::from(pswap.clone());
+        match build_record_from_columns(
+            pswap,
+            note.id(),
+            note.nullifier(),
+            0,
+            100,
+            50,
+            None,
+            None,
+            42,
+            BlockNumber::from(0),
+            BlockNumber::from(0),
+        ) {
+            Err(PswapLineageError::UnknownState(42)) => {},
+            other => panic!("expected UnknownState(42), got {other:?}"),
+        }
+    }
+
+    /// `asset_pair_tag()` and `order_id()` accessors delegate to the
+    /// stored `PswapNote` rather than persisting the values
+    /// separately. Verifies the delegation is consistent (no column
+    /// duplication that could drift from the blob).
+    #[test]
+    fn accessors_delegate_to_stored_pswap_note() {
+        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
+        let pswap =
+            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+
+        let expected_order_id = pswap.order_id();
+        let expected_tag =
+            miden_standards::note::PswapNote::create_tag(
+                pswap.note_type(),
+                pswap.offered_asset(),
+                pswap.storage().requested_asset(),
+            );
+
+        let note = miden_protocol::note::Note::from(pswap.clone());
+        let record = PswapLineageRecord {
+            original_pswap: pswap,
+            current_tip_note_id: note.id(),
+            current_tip_nullifier: note.nullifier(),
+            current_depth: 0,
+            remaining_offered: 100,
+            remaining_requested: 50,
+            last_consumer_account_id: None,
+            last_payout_amount: None,
+            state: PswapLineageState::Active,
+            created_at_block: BlockNumber::from(0),
+            updated_at_block: BlockNumber::from(0),
+        };
+
+        assert_eq!(record.order_id(), expected_order_id);
+        assert_eq!(record.asset_pair_tag(), expected_tag);
+        assert_eq!(record.creator_account_id(), creator);
+
+        // Silence Word-unused warning from the test_helpers import.
+        let _ = Word::default();
+    }
 }
 

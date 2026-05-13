@@ -229,7 +229,7 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             .ok_or(PswapLineageError::NotFound(order_id))?;
 
         if lineage.state != PswapLineageState::Active {
-            return Err(PswapLineageError::NotActive(lineage.state.as_u8()).into());
+            return Err(PswapLineageError::NotActive(lineage.state).into());
         }
 
         let tip_note: Note = if lineage.current_depth == 0 {

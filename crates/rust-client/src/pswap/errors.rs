@@ -7,7 +7,7 @@ use alloc::string::String;
 use miden_protocol::Felt;
 use miden_protocol::errors::NoteError;
 
-use crate::ClientError;
+use super::lineage::PswapLineageState;
 use crate::store::StoreError;
 
 /// Failures raised by the PSWAP chain-tracking subsystem.
@@ -33,10 +33,10 @@ pub enum PswapLineageError {
     NotFound(Felt),
 
     /// The lineage exists but is no longer `Active` — i.e. it was already
-    /// `FullyFilled` or `Reclaimed`. The terminal state's byte is included
-    /// for diagnostics.
-    #[error("PSWAP lineage is not active (state = {0}); no further rounds expected")]
-    NotActive(u8),
+    /// `FullyFilled` or `Reclaimed`. The terminal state is included for
+    /// diagnostics.
+    #[error("PSWAP lineage is not active (state = {0:?}); no further rounds expected")]
+    NotActive(PswapLineageState),
 
     /// The current tip stored on the lineage row is missing from the
     /// expected store table. Implies a desync between `pswap_lineages` and
@@ -81,12 +81,6 @@ pub enum PswapLineageError {
     /// Propagated from the store layer. Kept as a distinct variant rather
     /// than collapsing into `ClientError` so callers can match specifically
     /// on PSWAP store failures.
-    #[error("PSWAP store operation failed")]
+    #[error(transparent)]
     Store(#[from] StoreError),
-}
-
-impl From<PswapLineageError> for ClientError {
-    fn from(value: PswapLineageError) -> Self {
-        ClientError::PswapLineageError(value)
-    }
 }

@@ -19,7 +19,7 @@ use miden_client::pswap::{
 use miden_client::store::StoreError;
 use miden_client::utils::{Deserializable, DeserializationError, Serializable};
 use miden_protocol::Felt;
-use rusqlite::{Connection, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use super::SqliteStore;
 use crate::note::upsert_input_note_tx;
@@ -225,19 +225,36 @@ fn update_lineage_tip_tx(
 ) -> Result<(), StoreError> {
     let order_id_bytes = update.order_id.to_bytes();
 
-    // Confirm the lineage exists; otherwise `apply_pswap_round` is being
-    // called on a foreign order — fail loudly so the caller can fix the
-    // upstream observer/correlator logic that produced the update.
-    const CHECK_SQL: &str = "SELECT 1 FROM pswap_lineages WHERE order_id = ?";
-    let exists: bool = tx
-        .prepare_cached(CHECK_SQL)
+    // Fetch the row's current depth in the same transaction. This serves
+    // two purposes:
+    //   1. Confirms the lineage exists (a missing row indicates the
+    //      correlator emitted a round update for an order this store
+    //      never tracked — almost certainly a correlator bug).
+    //   2. Enforces the monotonic-depth invariant: every round must
+    //      advance by exactly 1. The store is the last line of defense
+    //      against off-by-one or duplicate-delivery bugs in the
+    //      correlator; silently writing a wrong depth would corrupt the
+    //      reconstruction chain (every subsequent
+    //      `PswapNote::payback_note` / `remainder_note` call depends on
+    //      `current_depth + 1` being the round that produced the tip).
+    const DEPTH_SQL: &str = "SELECT current_depth FROM pswap_lineages WHERE order_id = ?";
+    let current_depth: Option<u64> = tx
+        .prepare_cached(DEPTH_SQL)
         .into_store_error()?
-        .exists(params![order_id_bytes])
+        .query_row(params![order_id_bytes], |row| row.get(0))
+        .optional()
         .into_store_error()?;
-    if !exists {
-        return Err(StoreError::DatabaseError(std::format!(
+    let current_depth = current_depth.ok_or_else(|| {
+        StoreError::DatabaseError(std::format!(
             "apply_pswap_round: no lineage row for order_id {}",
             update.order_id
+        ))
+    })?;
+    if update.round_depth != current_depth + 1 {
+        return Err(StoreError::DatabaseError(std::format!(
+            "apply_pswap_round: round_depth {} for order_id {} does not advance by 1 \
+             (current_depth {}); refusing to corrupt the reconstruction chain",
+            update.round_depth, update.order_id, current_depth,
         )));
     }
 
@@ -311,19 +328,37 @@ fn insert_reconstructed_payback_tx(
     use miden_client::store::InputNoteRecord;
     use miden_client::store::input_note_states::ExpectedNoteState;
 
-    // Build an Expected InputNoteRecord. The default `NoteScreener` may
-    // have already inserted the same `note_id` row for a public payback;
-    // the underlying upsert is INSERT OR REPLACE so the row converges to
-    // one consistent entry either way.
+    // IDEMPOTENT INSERT (the trait doc says "INSERT OR IGNORE"). For a
+    // *public* payback the default `NoteScreener` will already have
+    // inserted this `note_id` in `Committed` state earlier in the same
+    // sync round, with a valid inclusion proof. The downstream
+    // `upsert_input_note_tx` is `INSERT OR REPLACE`, so calling it
+    // unconditionally here would downgrade the screener's `Committed`
+    // row back to `Expected` (no proof) — the note would not be
+    // consumable until the next sync re-upgraded it.
+    //
+    // The right semantics is "skip if a row already exists for this
+    // note_id." For a private payback the screener Discards and there is
+    // no prior row, so this is the only insertion site. For a public
+    // payback the screener's row is already richer than ours; leave it.
+    let note_id_text = payback_note.id().as_word().to_string();
+    const EXISTS_SQL: &str = "SELECT 1 FROM input_notes WHERE note_id = ?";
+    let already_present: bool = tx
+        .prepare_cached(EXISTS_SQL)
+        .into_store_error()?
+        .exists(params![note_id_text])
+        .into_store_error()?;
+    if already_present {
+        return Ok(());
+    }
+
     let metadata = payback_note.metadata().clone();
     let details = miden_client::note::NoteDetails::from(payback_note.clone());
-
     let state = ExpectedNoteState {
         metadata: Some(metadata.clone()),
         after_block_num: at_block,
         tag: Some(metadata.tag()),
     };
-
     let record = InputNoteRecord::new(details, None, state.into());
     upsert_input_note_tx(tx, &record)
 }

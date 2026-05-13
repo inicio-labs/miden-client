@@ -707,14 +707,23 @@ pub trait Store: Send + Sync {
     /// Atomically advances a lineage by one round. Inside a single SQL
     /// transaction the implementation MUST:
     ///
-    /// 1. Update the matching `pswap_lineages` row — tip, depth,
+    /// 1. Validate that `update.round_depth == current_depth + 1` against
+    ///    the row that exists for `update.order_id`. The store is the
+    ///    last line of defense against correlator off-by-ones and
+    ///    duplicate deliveries; silently writing a wrong depth corrupts
+    ///    the reconstruction chain. Missing row OR depth mismatch is a
+    ///    fail-loud condition.
+    /// 2. Update the matching `pswap_lineages` row — tip, depth,
     ///    remaining_*, last_consumer / last_payout, state, updated_at_block.
-    /// 2. If `update.reconstructed_payback.is_some()`, insert that note
-    ///    into `input_notes` using `INSERT OR IGNORE` on the `note_id` PK
-    ///    so the default screener's earlier insertion (for *public*
-    ///    paybacks) is not duplicated.
+    /// 3. If `update.reconstructed_payback.is_some()`, insert that note
+    ///    into `input_notes` with `INSERT OR IGNORE` semantics on the
+    ///    `note_id` PK. For a *public* payback the default `NoteScreener`
+    ///    will already have inserted the row in `Committed` state with a
+    ///    valid inclusion proof; overwriting it would downgrade the
+    ///    state. For a *private* payback this is the only insertion site
+    ///    (the screener discards private notes it does not own).
     ///
-    /// Returning before both steps commit leaves the lineage in an
+    /// Returning before all steps commit leaves the lineage in an
     /// observable half-applied state, so backends without genuine
     /// transactions (e.g. an early WASM stub) MUST surface a clear error
     /// rather than silently splitting the write.

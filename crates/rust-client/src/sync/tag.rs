@@ -79,13 +79,19 @@ pub enum NoteTagSource {
     Note(NoteDetailsCommitment),
     /// Tag manually added by the user.
     User,
-    /// Tag automatically registered when a PSWAP order was created on this
-    /// client, so the chain's remainder notes are delivered via sync. The
-    /// `Felt` is the originating order's `order_id` (== `serial[1]` of the
-    /// original PSWAP), which gives each subscription a unique source so
-    /// reference-counting is row-based: two orders on the same asset pair
-    /// produce two rows with the same `tag` but different sources.
-    PswapAssetPair(Felt),
+    /// Tag owned by a feature subsystem's subscription. The feature
+    /// inserts this row when the subscription begins and removes it
+    /// when the subscription terminates. The `Felt` is the per-
+    /// subscription identifier — chosen by the feature; only needs to
+    /// be unique within that feature's subscriptions so that two
+    /// concurrent subscriptions sharing the same `tag` end up as two
+    /// distinct rows (composite-key `(tag, source)` reference counting).
+    ///
+    /// Today's user: PSWAP chain tracking uses the originating order's
+    /// `order_id` (= `serial[1]` of the original PSWAP) as the key.
+    /// Any future feature with a subscribe/unsubscribe lifecycle can
+    /// reuse this variant by picking its own Felt-keyed scheme.
+    Subscription(Felt),
 }
 
 impl NoteTagRecord {
@@ -132,10 +138,10 @@ impl Serializable for NoteTagSource {
             },
             NoteTagSource::User => target.write_u8(2),
             // Discriminant 3 — appended after the existing variants to keep
-            // every pre-PSWAP row deserialising unchanged. Do not renumber.
-            NoteTagSource::PswapAssetPair(order_id) => {
+            // every pre-Subscription row deserialising unchanged. Do not renumber.
+            NoteTagSource::Subscription(key) => {
                 target.write_u8(3);
-                order_id.write_into(target);
+                key.write_into(target);
             },
         }
     }
@@ -147,7 +153,7 @@ impl Deserializable for NoteTagSource {
             0 => Ok(NoteTagSource::Account(AccountId::read_from(source)?)),
             1 => Ok(NoteTagSource::Note(NoteDetailsCommitment::read_from(source)?)),
             2 => Ok(NoteTagSource::User),
-            3 => Ok(NoteTagSource::PswapAssetPair(Felt::read_from(source)?)),
+            3 => Ok(NoteTagSource::Subscription(Felt::read_from(source)?)),
             val => Err(DeserializationError::InvalidValue(format!("Invalid tag source: {val}"))),
         }
     }
@@ -168,12 +174,9 @@ mod tag_source_tests {
     /// version with shifted bytes.
     #[test]
     fn note_tag_source_discriminants_are_stable() {
-        // TEMP-PROTOCOL-ADAPTER: protocol 0.15 makes Felt::new(u64) fallible
-        // (returns Result<Felt, FeltFromIntError>). Test values are small
-        // and fit cleanly in the canonical residue, so .unwrap() is fine.
         let cases = [
             (NoteTagSource::User, 2u8),
-            (NoteTagSource::PswapAssetPair(Felt::new(42).unwrap()), 3u8),
+            (NoteTagSource::Subscription(Felt::new(42).unwrap()), 3u8),
         ];
         for (variant, expected_disc) in cases {
             let bytes = variant.to_bytes();
@@ -186,29 +189,25 @@ mod tag_source_tests {
     }
 
     /// Round-trip every variant. Backward-compatibility check: even when
-    /// the `PswapAssetPair` discriminant (3) is added, the existing
+    /// the `Subscription` discriminant (3) is added, the existing
     /// `Account` / `Note` / `User` variants must continue to round-trip
     /// unchanged.
     #[test]
     fn note_tag_source_round_trip_every_variant() {
         let account_id =
             miden_protocol::account::AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
-        // TEMP-PROTOCOL-ADAPTER: protocol 0.15 made `NoteTagSource::Note`
-        // wrap `NoteDetailsCommitment` (was `NoteId`) and `Felt::new` is
-        // now fallible. Both are surface-only changes for this test —
-        // pick deterministic test values that round-trip cleanly.
         let details_commitment =
             miden_protocol::note::NoteDetailsCommitment::from_raw_commitments(
                 miden_protocol::Word::empty(),
                 miden_protocol::Word::empty(),
             );
-        let order_id = Felt::new(0xDEAD_BEEF_DEAD_BEEF).unwrap();
+        let subscription_key = Felt::new(0xDEAD_BEEF_DEAD_BEEF).unwrap();
 
         let variants = [
             NoteTagSource::Account(account_id),
             NoteTagSource::Note(details_commitment),
             NoteTagSource::User,
-            NoteTagSource::PswapAssetPair(order_id),
+            NoteTagSource::Subscription(subscription_key),
         ];
 
         for v in variants {

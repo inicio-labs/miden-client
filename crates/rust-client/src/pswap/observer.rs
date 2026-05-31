@@ -172,19 +172,35 @@ impl NoteObserver for PswapChainObserver {
 ///   protocol-invariant violation — treated as "skip" rather than error
 ///   since the observer is fail-open).
 fn pswap_attachment_fields(committed_note: &CommittedNote) -> Option<(Felt, u64, u64)> {
-    // TEMP-PROTOCOL-ADAPTER: protocol 0.15 / node wire format only
-    // carries `attachment_headers` + `attachments_commitment` on
-    // `NoteMetadata` — NOT the attachment content. For PRIVATE notes
-    // there is currently no sync-path that surfaces the content word
-    // `[fill_amount, order_id, depth, 0]`, so this observer is a no-op
-    // for private PSWAPs. Public notes route through the full-note
-    // path elsewhere and are handled by the post-sync correlator
-    // directly from `public_note_records`.
+    // ─── TEMP-PROTOCOL-ADAPTER ──────────────────────────────────────────
+    // This is the ONLY genuine TEMP in the PSWAP module. It reflects a
+    // functional gap, not a stylistic one.
     //
-    // BLOCKED-ON: upstream RPC extension to surface attachment content
-    // for private notes (or a tracked-account-targeted attachment
-    // fetch). Until then, PSWAP private-note chain tracking is broken
-    // and this helper always returns `None`.
+    // The wire format `Note { metadata, optional details, bytes attachments }`
+    // already carries attachment content for ALL notes — including
+    // private ones (the protocol's "public sidecar for private notes"
+    // guarantee). But upstream's client-side decoder discards the
+    // `attachments` bytes during proto→domain conversion: the
+    // in-memory `CommittedNote { note_id, metadata, inclusion_proof }`
+    // has no field for them, and `metadata` only carries
+    // `attachment_headers` (scheme markers) + `attachments_commitment`
+    // (digest) — not content.
+    //
+    // So we can DETECT a PSWAP-scheme attachment via the headers, but
+    // can't READ the content word `[amount, order_id, depth, 0]` for
+    // private notes. Public notes route through the full-note path
+    // (`public_note_records` in the post-sync correlator) and are
+    // unaffected; private notes (the primary PSWAP use case) are
+    // currently a no-op.
+    //
+    // REVERT-WHEN: upstream `miden-client` extends `CommittedNote` /
+    // `FetchedNote::Private` with a `NoteAttachments` field, decoding
+    // the already-on-the-wire `attachments` bytes. Estimated ~30 LOC
+    // in `crates/rust-client/src/rpc/domain/note.rs`. After the change,
+    // this helper becomes:
+    //   committed_note.attachments()
+    //       .find(PswapNote::PSWAP_ATTACHMENT_SCHEME)?
+    //       .content().as_words().first().map(|w| (w[1], w[2].as_canonical_u64(), w[0].as_canonical_u64()))
     let headers = committed_note.metadata().attachment_headers();
     let has_pswap = headers
         .iter()

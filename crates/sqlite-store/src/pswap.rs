@@ -130,7 +130,7 @@ impl SqliteStore {
     }
 }
 
-/// Removes the `(asset_pair_tag, PswapAssetPair(order_id))` row in `tags`
+/// Removes the `(asset_pair_tag, Subscription(order_id))` row in `tags`
 /// for the given lineage. Deserialises the row's `original_pswap` to
 /// recompute the tag — the round update does not carry it.
 ///
@@ -165,7 +165,7 @@ fn remove_pswap_asset_pair_tag_tx(
 
     remove_note_tag_tx(
         tx,
-        NoteTagRecord { tag, source: NoteTagSource::PswapAssetPair(order_id) },
+        NoteTagRecord { tag, source: NoteTagSource::Subscription(order_id) },
     )?;
     Ok(())
 }
@@ -428,11 +428,8 @@ fn insert_reconstructed_payback_tx(
     // proof (reclaim rounds emit no payback, so this branch is
     // currently unreachable in practice, but the fallback keeps the
     // function total).
-    // TEMP-PROTOCOL-ADAPTER: `InputNoteRecord::new` on protocol 0.15 takes
-    // an explicit `NoteAttachments` arg between `details` and `created_at`.
-    // The reconstructed payback for v1 PSWAP carries no attachments
-    // (P2ID has no PSWAP-style attachment word), so pass an empty
-    // collection.
+    // The reconstructed payback is a P2ID (no PSWAP-style attachment word),
+    // so it carries no attachments.
     let attachments = miden_protocol::note::NoteAttachments::default();
     let record = match inclusion_proof {
         Some(proof) => InputNoteRecord::new(
@@ -531,7 +528,6 @@ mod tests {
             current_tip_note_id: note.id(),
             current_tip_nullifier: note.nullifier(),
             current_depth: 0,
-            // TEMP-PROTOCOL-ADAPTER: FungibleAsset::amount returns AssetAmount on 0.15.
             remaining_offered: pswap.offered_asset().amount().into(),
             remaining_requested: pswap.storage().requested_asset_amount(),
             last_consumer_account_id: None,

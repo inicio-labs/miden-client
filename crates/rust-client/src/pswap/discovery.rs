@@ -236,14 +236,12 @@ fn build_round_update(
                 .remaining_offered
                 .saturating_sub(remainder_cand.amount);
 
-            // TEMP-PROTOCOL-ADAPTER: protocol 0.15 wraps the attachment
-            // word in a typed `PswapNoteAttachment` struct and asset
-            // amounts in `AssetAmount`. Constructions are infallible
-            // here because (a) `round_depth` upstream is u32-bounded and
-            // (b) `new_remaining_*` are arithmetic over u64 values that
-            // were already validated as fitting in `AssetAmount`.
-            // REVERT-WHEN: this client adopts the typed attachment
-            // directly in `PswapChainNoteUpdate`.
+            // The protocol's `remainder_note` builder takes a typed
+            // `PswapNoteAttachment` and `AssetAmount` newtypes.
+            // Constructions are infallible in practice — `round_depth`
+            // is u32-bounded upstream and `new_remaining_*` are
+            // arithmetic over u64 values already validated to fit in
+            // `AssetAmount` — but we propagate errors for completeness.
             let attachment = PswapNoteAttachment::new(
                 AssetAmount::new(remainder_cand.amount)
                     .map_err(crate::ClientError::AssetError)?,
@@ -321,8 +319,6 @@ fn find_payback_index(
 ) -> Result<(usize, Note), ClientError> {
     let mut reconstructed_ids: Vec<NoteId> = Vec::with_capacity(matches.len());
     for (i, cand) in matches.iter().enumerate() {
-        // TEMP-PROTOCOL-ADAPTER: payback_note now takes a typed
-        // `&PswapNoteAttachment` (was `(consumer, depth, amount)`).
         let attachment = PswapNoteAttachment::new(
             AssetAmount::new(cand.amount).map_err(crate::ClientError::AssetError)?,
             cand.order_id,
@@ -354,7 +350,6 @@ fn reconstruct_payback(
     candidate: &PswapChainNoteUpdate,
     round_depth: u64,
 ) -> Result<Note, ClientError> {
-    // TEMP-PROTOCOL-ADAPTER: payback_note takes &PswapNoteAttachment on 0.15.
     let attachment = PswapNoteAttachment::new(
         AssetAmount::new(candidate.amount).map_err(ClientError::AssetError)?,
         candidate.order_id,
@@ -475,11 +470,9 @@ mod tests {
     use super::super::lineage::test_helpers::{build_test_pswap, fixed_account_ids};
     use super::*;
 
-    /// TEMP-PROTOCOL-ADAPTER: protocol 0.15 wraps the per-round
-    /// reconstruction inputs in a typed `PswapNoteAttachment`. This
-    /// helper bridges the old `(amount, depth)` test-style inputs to
-    /// the new struct. Tests use the canonical `order_id` from the
-    /// PSWAP under test.
+    /// Builds a typed `PswapNoteAttachment` from raw test inputs, using
+    /// the canonical `order_id` from the PSWAP under test. Centralises
+    /// the conversion so each test reads as `(amount, depth)`.
     fn pswap_attachment(pswap: &PswapNote, depth: u64, amount: u64) -> PswapNoteAttachment {
         PswapNoteAttachment::new(
             AssetAmount::new(amount).expect("amount fits in AssetAmount"),

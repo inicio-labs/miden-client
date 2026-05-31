@@ -513,10 +513,10 @@ mod tests {
             .sender(sender)
             .storage(storage)
             .serial_number(Word::from([
-                miden_protocol::Felt::new(1),
-                miden_protocol::Felt::new(2),
-                miden_protocol::Felt::new(3),
-                miden_protocol::Felt::new(4),
+                miden_protocol::Felt::new(1).unwrap(),
+                miden_protocol::Felt::new(2).unwrap(),
+                miden_protocol::Felt::new(3).unwrap(),
+                miden_protocol::Felt::new(4).unwrap(),
             ]))
             .note_type(NoteType::Public)
             .offered_asset(FungibleAsset::new(offered_faucet, offered_amount).unwrap())
@@ -531,7 +531,8 @@ mod tests {
             current_tip_note_id: note.id(),
             current_tip_nullifier: note.nullifier(),
             current_depth: 0,
-            remaining_offered: pswap.offered_asset().amount(),
+            // TEMP-PROTOCOL-ADAPTER: FungibleAsset::amount returns AssetAmount on 0.15.
+            remaining_offered: pswap.offered_asset().amount().into(),
             remaining_requested: pswap.storage().requested_asset_amount(),
             last_consumer_account_id: None,
             last_payout_amount: None,
@@ -633,7 +634,7 @@ mod tests {
         let store = create_test_store().await;
         let consumer =
             AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
-        let phantom_order_id = miden_protocol::Felt::new(0xDEAD_BEEF);
+        let phantom_order_id = miden_protocol::Felt::new(0xDEAD_BEEF).unwrap();
 
         let bogus = PswapLineageRoundUpdate {
             order_id: phantom_order_id,

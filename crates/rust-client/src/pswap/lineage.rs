@@ -367,11 +367,12 @@ pub(crate) mod test_helpers {
         PswapNote::builder()
             .sender(sender)
             .storage(storage)
+            // TEMP-PROTOCOL-ADAPTER: protocol 0.15 makes `Felt::new` fallible.
             .serial_number(Word::from([
-                miden_protocol::Felt::new(1),
-                miden_protocol::Felt::new(2),
-                miden_protocol::Felt::new(3),
-                miden_protocol::Felt::new(4),
+                miden_protocol::Felt::new(1).unwrap(),
+                miden_protocol::Felt::new(2).unwrap(),
+                miden_protocol::Felt::new(3).unwrap(),
+                miden_protocol::Felt::new(4).unwrap(),
             ]))
             .note_type(NoteType::Public)
             .offered_asset(offered)

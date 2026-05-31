@@ -130,11 +130,22 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             let order_id = record.order_id();
 
             self.store.upsert_pswap_lineage(&record).await?;
-            self.insert_note_tag(NoteTagRecord {
-                tag: asset_pair_tag,
-                source: NoteTagSource::PswapAssetPair(order_id),
-            })
-            .await?;
+            // TEMP-PROTOCOL-ADAPTER: `Client::insert_note_tag` was renamed
+            // to `add_note_tag` and only accepts `(NoteTag)` with an
+            // implicit `NoteTagSource::User` source. We need to register
+            // with `PswapAssetPair(order_id)` source so the tag is
+            // reference-counted per-lineage and dropped on terminal
+            // state. Bypass the client wrapper and call the store
+            // directly.
+            // REVERT-WHEN: upstream exposes a client-level wrapper that
+            // accepts a full `NoteTagRecord` (or PSWAP becomes a
+            // first-class concern of `Client::add_note_tag`).
+            self.store
+                .add_note_tag(NoteTagRecord {
+                    tag: asset_pair_tag,
+                    source: NoteTagSource::PswapAssetPair(order_id),
+                })
+                .await?;
         }
 
         Ok(())
@@ -151,7 +162,9 @@ fn build_initial_lineage_record(
         current_tip_note_id: note.id(),
         current_tip_nullifier: note.nullifier(),
         current_depth: 0,
-        remaining_offered: pswap.offered_asset().amount(),
+        // TEMP-PROTOCOL-ADAPTER: protocol 0.15 returns `AssetAmount`
+        // from `FungibleAsset::amount()`. Convert to u64 for storage.
+        remaining_offered: pswap.offered_asset().amount().into(),
         remaining_requested: pswap.storage().requested_asset_amount(),
         last_consumer_account_id: None,
         last_payout_amount: None,
@@ -263,14 +276,31 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
                 )),
             )?;
 
+            // TEMP-PROTOCOL-ADAPTER: protocol 0.15 takes `&PswapNoteAttachment`
+            // (was `(depth, payout)`) and `AssetAmount` for remainders.
+            let attachment = miden_standards::note::PswapNoteAttachment::new(
+                miden_protocol::asset::AssetAmount::new(last_payout)
+                    .map_err(ClientError::AssetError)?,
+                lineage.order_id(),
+                u32::try_from(lineage.current_depth).map_err(|_| {
+                    PswapLineageError::InconsistentRow(alloc::string::String::from(
+                        "current_depth does not fit in u32",
+                    ))
+                })?,
+            );
+            let new_remaining_offered =
+                miden_protocol::asset::AssetAmount::new(lineage.remaining_offered)
+                    .map_err(ClientError::AssetError)?;
+            let new_remaining_requested =
+                miden_protocol::asset::AssetAmount::new(lineage.remaining_requested)
+                    .map_err(ClientError::AssetError)?;
             lineage
                 .original_pswap
                 .remainder_note(
                     last_consumer,
-                    lineage.current_depth,
-                    last_payout,
-                    lineage.remaining_offered,
-                    lineage.remaining_requested,
+                    &attachment,
+                    new_remaining_offered,
+                    new_remaining_requested,
                 )
                 .map_err(PswapLineageError::Reconstruction)?
         };

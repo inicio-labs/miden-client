@@ -428,9 +428,16 @@ fn insert_reconstructed_payback_tx(
     // proof (reclaim rounds emit no payback, so this branch is
     // currently unreachable in practice, but the fallback keeps the
     // function total).
+    // TEMP-PROTOCOL-ADAPTER: `InputNoteRecord::new` on protocol 0.15 takes
+    // an explicit `NoteAttachments` arg between `details` and `created_at`.
+    // The reconstructed payback for v1 PSWAP carries no attachments
+    // (P2ID has no PSWAP-style attachment word), so pass an empty
+    // collection.
+    let attachments = miden_protocol::note::NoteAttachments::default();
     let record = match inclusion_proof {
         Some(proof) => InputNoteRecord::new(
             details,
+            attachments.clone(),
             None,
             UnverifiedNoteState {
                 metadata,
@@ -444,7 +451,7 @@ fn insert_reconstructed_payback_tx(
                 after_block_num: at_block,
                 tag: Some(metadata.tag()),
             };
-            InputNoteRecord::new(details, None, state.into())
+            InputNoteRecord::new(details, attachments, None, state.into())
         },
     };
     upsert_input_note_tx(tx, &record)

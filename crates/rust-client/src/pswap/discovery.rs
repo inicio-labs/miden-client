@@ -14,9 +14,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use miden_protocol::Felt;
+use miden_protocol::asset::AssetAmount;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{Note, NoteId, Nullifier};
-use miden_standards::note::PswapNote;
+use miden_standards::note::{PswapNote, PswapNoteAttachment};
 use tracing::error;
 
 use super::errors::PswapLineageError;
@@ -235,13 +236,35 @@ fn build_round_update(
                 .remaining_offered
                 .saturating_sub(remainder_cand.amount);
 
+            // TEMP-PROTOCOL-ADAPTER: protocol 0.15 wraps the attachment
+            // word in a typed `PswapNoteAttachment` struct and asset
+            // amounts in `AssetAmount`. Constructions are infallible
+            // here because (a) `round_depth` upstream is u32-bounded and
+            // (b) `new_remaining_*` are arithmetic over u64 values that
+            // were already validated as fitting in `AssetAmount`.
+            // REVERT-WHEN: this client adopts the typed attachment
+            // directly in `PswapChainNoteUpdate`.
+            let attachment = PswapNoteAttachment::new(
+                AssetAmount::new(remainder_cand.amount)
+                    .map_err(crate::ClientError::AssetError)?,
+                current.order_id(),
+                u32::try_from(round_depth)
+                    .map_err(|_| PswapLineageError::Reconstruction(
+                        miden_protocol::errors::NoteError::other(
+                            "round_depth does not fit in u32",
+                        ),
+                    ))?,
+            );
+            let new_remaining_offered_a = AssetAmount::new(new_remaining_offered)
+                .map_err(crate::ClientError::AssetError)?;
+            let new_remaining_requested_a = AssetAmount::new(new_remaining_requested)
+                .map_err(crate::ClientError::AssetError)?;
             let remainder_note = original
                 .remainder_note(
                     remainder_cand.sender,
-                    round_depth,
-                    remainder_cand.amount,
-                    new_remaining_offered,
-                    new_remaining_requested,
+                    &attachment,
+                    new_remaining_offered_a,
+                    new_remaining_requested_a,
                 )
                 .map_err(PswapLineageError::Reconstruction)?;
 
@@ -298,8 +321,19 @@ fn find_payback_index(
 ) -> Result<(usize, Note), ClientError> {
     let mut reconstructed_ids: Vec<NoteId> = Vec::with_capacity(matches.len());
     for (i, cand) in matches.iter().enumerate() {
+        // TEMP-PROTOCOL-ADAPTER: payback_note now takes a typed
+        // `&PswapNoteAttachment` (was `(consumer, depth, amount)`).
+        let attachment = PswapNoteAttachment::new(
+            AssetAmount::new(cand.amount).map_err(crate::ClientError::AssetError)?,
+            cand.order_id,
+            u32::try_from(round_depth).map_err(|_| {
+                PswapLineageError::Reconstruction(miden_protocol::errors::NoteError::other(
+                    "round_depth does not fit in u32",
+                ))
+            })?,
+        );
         let reconstructed = original
-            .payback_note(cand.sender, round_depth, cand.amount)
+            .payback_note(cand.sender, &attachment)
             .map_err(PswapLineageError::Reconstruction)?;
         if reconstructed.id() == cand.note_id {
             return Ok((i, reconstructed));
@@ -320,8 +354,18 @@ fn reconstruct_payback(
     candidate: &PswapChainNoteUpdate,
     round_depth: u64,
 ) -> Result<Note, ClientError> {
+    // TEMP-PROTOCOL-ADAPTER: payback_note takes &PswapNoteAttachment on 0.15.
+    let attachment = PswapNoteAttachment::new(
+        AssetAmount::new(candidate.amount).map_err(ClientError::AssetError)?,
+        candidate.order_id,
+        u32::try_from(round_depth).map_err(|_| {
+            PswapLineageError::Reconstruction(miden_protocol::errors::NoteError::other(
+                "round_depth does not fit in u32",
+            ))
+        })?,
+    );
     let reconstructed = original
-        .payback_note(candidate.sender, round_depth, candidate.amount)
+        .payback_note(candidate.sender, &attachment)
         .map_err(PswapLineageError::Reconstruction)?;
     if reconstructed.id() != candidate.note_id {
         return Err(PswapLineageError::CommitmentMismatch {
@@ -423,11 +467,29 @@ mod tests {
     use alloc::vec::Vec;
 
     use miden_protocol::account::AccountId;
+    use miden_protocol::asset::AssetAmount;
     use miden_protocol::crypto::merkle::SparseMerklePath;
     use miden_protocol::note::NoteInclusionProof;
+    use miden_standards::note::PswapNoteAttachment;
 
     use super::super::lineage::test_helpers::{build_test_pswap, fixed_account_ids};
     use super::*;
+
+    /// TEMP-PROTOCOL-ADAPTER: protocol 0.15 wraps the per-round
+    /// reconstruction inputs in a typed `PswapNoteAttachment`. This
+    /// helper bridges the old `(amount, depth)` test-style inputs to
+    /// the new struct. Tests use the canonical `order_id` from the
+    /// PSWAP under test.
+    fn pswap_attachment(pswap: &PswapNote, depth: u64, amount: u64) -> PswapNoteAttachment {
+        PswapNoteAttachment::new(
+            AssetAmount::new(amount).expect("amount fits in AssetAmount"),
+            pswap.order_id(),
+            u32::try_from(depth).expect("depth fits in u32"),
+        )
+    }
+    fn aa(v: u64) -> AssetAmount {
+        AssetAmount::new(v).expect("amount fits in AssetAmount")
+    }
 
     /// Minimum-valid inclusion proof. The discovery correlator never
     /// inspects the proof's Merkle path; it only threads the value to
@@ -507,9 +569,9 @@ mod tests {
         let new_off = 100 - payout_amount;
         let new_req = 50 - fill_amount;
 
-        let payback = pswap.payback_note(consumer, 1, fill_amount).unwrap();
+        let payback = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, fill_amount)).unwrap();
         let remainder = pswap
-            .remainder_note(consumer, 1, payout_amount, new_off, new_req)
+            .remainder_note(consumer, &pswap_attachment(&pswap, 1, payout_amount), aa(new_off), aa(new_req))
             .unwrap();
 
         let order_id = pswap.order_id();
@@ -558,7 +620,7 @@ mod tests {
         let record = initial_record(pswap.clone(), 30, 50);
 
         let fill_amount = 50; // exhausts requested side
-        let payback = pswap.payback_note(consumer, 1, fill_amount).unwrap();
+        let payback = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, fill_amount)).unwrap();
         let order_id = pswap.order_id();
         let cand = chain_update_from(&payback, order_id, 1, fill_amount, consumer, 9);
 
@@ -635,9 +697,9 @@ mod tests {
         // Three reconstructed-payback candidates at different fill
         // amounts. The exact bodies don't matter — `build_round_update`
         // takes the count-based fast path before reconstruction.
-        let p1 = pswap.payback_note(consumer, 1, 10).unwrap();
-        let p2 = pswap.payback_note(consumer, 1, 20).unwrap();
-        let p3 = pswap.payback_note(consumer, 1, 30).unwrap();
+        let p1 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, 10)).unwrap();
+        let p2 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, 20)).unwrap();
+        let p3 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, 30)).unwrap();
         let order_id = pswap.order_id();
         let c1 = chain_update_from(&p1, order_id, 1, 10, consumer, 3);
         let c2 = chain_update_from(&p2, order_id, 1, 20, consumer, 3);
@@ -673,9 +735,9 @@ mod tests {
         let payout1 = 40;
         let new_off1 = 100 - payout1;
         let new_req1 = 50 - fill1;
-        let payback1 = pswap.payback_note(consumer, 1, fill1).unwrap();
+        let payback1 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, fill1)).unwrap();
         let remainder1 = pswap
-            .remainder_note(consumer, 1, payout1, new_off1, new_req1)
+            .remainder_note(consumer, &pswap_attachment(&pswap, 1, payout1), aa(new_off1), aa(new_req1))
             .unwrap();
         let order_id = pswap.order_id();
         let cand_p1 = chain_update_from(&payback1, order_id, 1, fill1, consumer, 11);
@@ -696,7 +758,7 @@ mod tests {
 
         // ── Round 2: full fill of the remainder, exhausts requested side.
         let fill2 = new_req1; // = 30
-        let payback2 = pswap.payback_note(consumer, 2, fill2).unwrap();
+        let payback2 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 2, fill2)).unwrap();
         let cand_p2 = chain_update_from(&payback2, order_id, 2, fill2, consumer, 11);
 
         let update2 = build_round_update(&record1, 2, BlockNumber::from(11), &[&cand_p2])

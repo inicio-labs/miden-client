@@ -172,20 +172,30 @@ impl NoteObserver for PswapChainObserver {
 ///   protocol-invariant violation — treated as "skip" rather than error
 ///   since the observer is fail-open).
 fn pswap_attachment_fields(committed_note: &CommittedNote) -> Option<(Felt, u64, u64)> {
-    // The committed metadata must be `Full` — i.e. the
-    // `GetNotesById` upgrade has run. For a `Header`-state note the
-    // attachments side-channel on `CommittedNote` is empty by
-    // construction (see `CommittedNote::set_metadata` doc).
-    let _ = committed_note.metadata()?;
-
-    let attachment = committed_note
-        .attachments()
+    // TEMP-PROTOCOL-ADAPTER: protocol 0.15 / node wire format only
+    // carries `attachment_headers` + `attachments_commitment` on
+    // `NoteMetadata` — NOT the attachment content. For PRIVATE notes
+    // there is currently no sync-path that surfaces the content word
+    // `[fill_amount, order_id, depth, 0]`, so this observer is a no-op
+    // for private PSWAPs. Public notes route through the full-note
+    // path elsewhere and are handled by the post-sync correlator
+    // directly from `public_note_records`.
+    //
+    // BLOCKED-ON: upstream RPC extension to surface attachment content
+    // for private notes (or a tracked-account-targeted attachment
+    // fetch). Until then, PSWAP private-note chain tracking is broken
+    // and this helper always returns `None`.
+    let headers = committed_note.metadata().attachment_headers();
+    let has_pswap = headers
         .iter()
-        .find(|att| att.attachment_scheme() == PswapNote::PSWAP_ATTACHMENT_SCHEME)?;
+        .any(|h| h.scheme() == Some(PswapNote::PSWAP_ATTACHMENT_SCHEME));
+    if !has_pswap {
+        return None;
+    }
 
-    let word = attachment.content().as_words().first()?;
-    let amount = word[0].as_canonical_u64();
-    let order_id = word[1];
-    let depth = word[2].as_canonical_u64();
-    Some((order_id, depth, amount))
+    // We *know* this is a PSWAP note (header scheme matches), but we
+    // can't read the content word from sync data alone. Skip silently;
+    // the post-sync correlator will not see a `PswapChainNoteUpdate`
+    // for this note and the lineage will stall at the previous tip.
+    None
 }

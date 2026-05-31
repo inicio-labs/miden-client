@@ -168,9 +168,12 @@ mod tag_source_tests {
     /// version with shifted bytes.
     #[test]
     fn note_tag_source_discriminants_are_stable() {
+        // TEMP-PROTOCOL-ADAPTER: protocol 0.15 makes Felt::new(u64) fallible
+        // (returns Result<Felt, FeltFromIntError>). Test values are small
+        // and fit cleanly in the canonical residue, so .unwrap() is fine.
         let cases = [
             (NoteTagSource::User, 2u8),
-            (NoteTagSource::PswapAssetPair(Felt::new(42)), 3u8),
+            (NoteTagSource::PswapAssetPair(Felt::new(42).unwrap()), 3u8),
         ];
         for (variant, expected_disc) in cases {
             let bytes = variant.to_bytes();
@@ -190,17 +193,20 @@ mod tag_source_tests {
     fn note_tag_source_round_trip_every_variant() {
         let account_id =
             miden_protocol::account::AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
-        // Build a stable NoteId by hashing a known word pair — the exact
-        // shape doesn't matter, only that the round-trip preserves it.
-        let note_id = miden_protocol::note::NoteId::new(
-            miden_protocol::Word::empty(),
-            miden_protocol::Word::empty(),
-        );
-        let order_id = Felt::new(0xDEAD_BEEF_DEAD_BEEF);
+        // TEMP-PROTOCOL-ADAPTER: protocol 0.15 made `NoteTagSource::Note`
+        // wrap `NoteDetailsCommitment` (was `NoteId`) and `Felt::new` is
+        // now fallible. Both are surface-only changes for this test —
+        // pick deterministic test values that round-trip cleanly.
+        let details_commitment =
+            miden_protocol::note::NoteDetailsCommitment::from_raw_commitments(
+                miden_protocol::Word::empty(),
+                miden_protocol::Word::empty(),
+            );
+        let order_id = Felt::new(0xDEAD_BEEF_DEAD_BEEF).unwrap();
 
         let variants = [
             NoteTagSource::Account(account_id),
-            NoteTagSource::Note(note_id),
+            NoteTagSource::Note(details_commitment),
             NoteTagSource::User,
             NoteTagSource::PswapAssetPair(order_id),
         ];

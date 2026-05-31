@@ -160,8 +160,14 @@ fn build_initial_lineage_record(
         current_tip_note_id: note.id(),
         current_tip_nullifier: note.nullifier(),
         current_depth: 0,
-        remaining_offered: pswap.offered_asset().amount().into(),
-        remaining_requested: pswap.storage().requested_asset_amount(),
+        remaining_offered: pswap.offered_asset().amount(),
+        // `requested_asset_amount()` returns u64 (legacy shape on
+        // `PswapNoteStorage`); the value originated from a validated
+        // `FungibleAsset` so it's always ≤ `AssetAmount::MAX`.
+        remaining_requested: miden_protocol::asset::AssetAmount::new(
+            pswap.storage().requested_asset_amount(),
+        )
+        .expect("PSWAP storage's requested_asset_amount is bounded by FungibleAsset's invariant"),
         last_consumer_account_id: None,
         last_payout_amount: None,
         state: PswapLineageState::Active,
@@ -275,10 +281,11 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             // The protocol's `remainder_note` builder takes a typed
             // `PswapNoteAttachment { amount, order_id, depth }` rather
             // than loose `(depth, payout)` args; construct it from the
-            // lineage's persisted round-N state.
+            // lineage's persisted round-N state. `last_payout` /
+            // `remaining_*` are already `AssetAmount` after the
+            // store-side refactor, so no per-call conversion needed.
             let attachment = miden_standards::note::PswapNoteAttachment::new(
-                miden_protocol::asset::AssetAmount::new(last_payout)
-                    .map_err(ClientError::AssetError)?,
+                last_payout,
                 lineage.order_id(),
                 u32::try_from(lineage.current_depth).map_err(|_| {
                     PswapLineageError::InconsistentRow(alloc::string::String::from(
@@ -286,19 +293,13 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
                     ))
                 })?,
             );
-            let new_remaining_offered =
-                miden_protocol::asset::AssetAmount::new(lineage.remaining_offered)
-                    .map_err(ClientError::AssetError)?;
-            let new_remaining_requested =
-                miden_protocol::asset::AssetAmount::new(lineage.remaining_requested)
-                    .map_err(ClientError::AssetError)?;
             lineage
                 .original_pswap
                 .remainder_note(
                     last_consumer,
                     &attachment,
-                    new_remaining_offered,
-                    new_remaining_requested,
+                    lineage.remaining_offered,
+                    lineage.remaining_requested,
                 )
                 .map_err(PswapLineageError::Reconstruction)?
         };

@@ -2,12 +2,13 @@
 //!
 //! See module-level docs on [`crate::pswap`].
 
+use alloc::format;
 use alloc::string::String;
 
 use miden_protocol::Felt;
 use miden_protocol::Word;
 use miden_protocol::account::AccountId;
-use miden_protocol::asset::FungibleAsset;
+use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{Note, NoteId, NoteInclusionProof, NoteTag, NoteType, Nullifier};
 use miden_standards::note::PswapNote;
@@ -89,12 +90,17 @@ pub struct PswapLineageRecord {
     pub current_depth: u64,
     /// Offered-asset units still unfilled at this point in the chain. Starts
     /// at `original_pswap.offered_asset().amount()` and decreases by the
-    /// per-round `payout_amount` until reaching zero.
-    pub remaining_offered: u64,
+    /// per-round `payout_amount` until reaching zero. Typed as
+    /// [`AssetAmount`] so the `<= AssetAmount::MAX` invariant is enforced
+    /// at every construction site; SQLite still stores as INTEGER bytes
+    /// — the conversion happens at the row decoder
+    /// ([`build_record_from_columns`]).
+    pub remaining_offered: AssetAmount,
     /// Requested-asset units still unfilled. Starts at
     /// `original_pswap.storage().requested_asset_amount()` and decreases by
-    /// the per-round `fill_amount`.
-    pub remaining_requested: u64,
+    /// the per-round `fill_amount`. See [`Self::remaining_offered`] for
+    /// notes on the `AssetAmount` boundary.
+    pub remaining_requested: AssetAmount,
 
     /// Account that consumed the previous tip and emitted the current one.
     /// `None` iff `current_depth == 0` (the original tip was not consumed
@@ -104,7 +110,7 @@ pub struct PswapLineageRecord {
     /// Offered-asset units paid out in the round that produced the current
     /// tip. `None` iff `current_depth == 0`. Required input to
     /// [`PswapNote::remainder_note`].
-    pub last_payout_amount: Option<u64>,
+    pub last_payout_amount: Option<AssetAmount>,
 
     /// Current lifecycle state — see [`PswapLineageState`].
     pub state: PswapLineageState,
@@ -207,17 +213,17 @@ pub struct PswapLineageRoundUpdate {
     /// the payback's attachment word slot `[0]`; falls back to
     /// `previous_remaining_requested` for a terminal full-fill that emits
     /// no remainder.
-    pub fill_amount: u64,
+    pub fill_amount: AssetAmount,
     /// Offered-asset units paid out to the consumer this round. Read from
     /// the remainder's attachment word slot `[0]`; equals
     /// `previous_remaining_offered` for a terminal full-fill or a reclaim.
-    pub payout_amount: u64,
+    pub payout_amount: AssetAmount,
     /// `previous_remaining_offered - payout_amount` (0 on full fill /
     /// reclaim).
-    pub new_remaining_offered: u64,
+    pub new_remaining_offered: AssetAmount,
     /// `previous_remaining_requested - fill_amount` (0 on full fill /
     /// reclaim).
-    pub new_remaining_requested: u64,
+    pub new_remaining_requested: AssetAmount,
     /// Terminal state after this round — `Active` if a new remainder was
     /// produced, `FullyFilled` if the requested side was exhausted, or
     /// `Reclaimed` if the consumer is the creator and no outputs were
@@ -301,6 +307,25 @@ pub fn build_record_from_columns(
             "last_consumer_account_id and last_payout_amount must both be set iff current_depth > 0",
         )));
     }
+
+    // SQLite stores INTEGER bytes; validate the `<= AssetAmount::MAX`
+    // invariant at this single boundary instead of fanning out
+    // unwraps across every reader. A row exceeding MAX would either be
+    // corruption or a legacy row from before the type tightening — both
+    // cases warrant an InconsistentRow error rather than a silent pass.
+    let to_amount = |raw: u64, field: &'static str| -> Result<AssetAmount, PswapLineageError> {
+        AssetAmount::new(raw).map_err(|err| {
+            PswapLineageError::InconsistentRow(format!(
+                "{field} = {raw} exceeds AssetAmount::MAX: {err}"
+            ))
+        })
+    };
+    let remaining_offered = to_amount(remaining_offered, "remaining_offered")?;
+    let remaining_requested = to_amount(remaining_requested, "remaining_requested")?;
+    let last_payout_amount = match last_payout_amount {
+        Some(raw) => Some(to_amount(raw, "last_payout_amount")?),
+        None => None,
+    };
 
     Ok(PswapLineageRecord {
         original_pswap,
@@ -444,8 +469,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(record.current_depth, 0);
-        assert_eq!(record.remaining_offered, 100);
-        assert_eq!(record.remaining_requested, 50);
+        assert_eq!(record.remaining_offered, AssetAmount::new(100).unwrap());
+        assert_eq!(record.remaining_requested, AssetAmount::new(50).unwrap());
         assert!(record.last_consumer_account_id.is_none());
         assert!(record.last_payout_amount.is_none());
         assert_eq!(record.state, PswapLineageState::Active);
@@ -476,7 +501,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(record.last_consumer_account_id, Some(consumer));
-        assert_eq!(record.last_payout_amount, Some(20));
+        assert_eq!(record.last_payout_amount, Some(AssetAmount::new(20).unwrap()));
     }
 
     /// `current_depth == 0` with a populated `last_consumer` is the
@@ -585,8 +610,8 @@ mod tests {
             current_tip_note_id: note.id(),
             current_tip_nullifier: note.nullifier(),
             current_depth: 0,
-            remaining_offered: 100,
-            remaining_requested: 50,
+            remaining_offered: AssetAmount::new(100).unwrap(),
+            remaining_requested: AssetAmount::new(50).unwrap(),
             last_consumer_account_id: None,
             last_payout_amount: None,
             state: PswapLineageState::Active,

@@ -168,14 +168,14 @@ fn build_round_update(
                 order_id: current.order_id(),
                 round_depth,
                 consumer_account_id: current.creator_account_id(),
-                fill_amount: 0,
+                fill_amount: AssetAmount::ZERO,
                 payout_amount: current.remaining_offered,
-                new_remaining_offered: 0,
+                new_remaining_offered: AssetAmount::ZERO,
                 // Terminal state: per the field doc on
                 // `PswapLineageRoundUpdate::new_remaining_requested`, both
                 // remaining_* columns settle to 0 on a reclaim (no further
                 // rounds can fill the requested side).
-                new_remaining_requested: 0,
+                new_remaining_requested: AssetAmount::ZERO,
                 new_state: PswapLineageState::Reclaimed,
                 new_tip_note_id: None,
                 new_tip_nullifier: None,
@@ -192,16 +192,25 @@ fn build_round_update(
             let candidate = matches[0];
             let payback = reconstruct_payback(original, candidate, round_depth)?;
 
+            // Saturating subtraction (preserves the v1 semantics of "round
+            // off any over-fill rather than refuse to apply"). Convert
+            // u64 → AssetAmount at the boundary; the result is always
+            // <= MAX because we started from a validated AssetAmount.
+            let new_remaining_requested = AssetAmount::new(
+                u64::from(current.remaining_requested).saturating_sub(candidate.amount),
+            )
+            .expect("saturating_sub of validated AssetAmount stays within MAX");
+            let fill_amount =
+                AssetAmount::new(candidate.amount).map_err(crate::ClientError::AssetError)?;
+
             Ok(Some(PswapLineageRoundUpdate {
                 order_id: current.order_id(),
                 round_depth,
                 consumer_account_id: candidate.sender,
-                fill_amount: candidate.amount,
+                fill_amount,
                 payout_amount: current.remaining_offered,
-                new_remaining_offered: 0,
-                new_remaining_requested: current
-                    .remaining_requested
-                    .saturating_sub(candidate.amount),
+                new_remaining_offered: AssetAmount::ZERO,
+                new_remaining_requested,
                 new_state: PswapLineageState::FullyFilled,
                 new_tip_note_id: None,
                 new_tip_nullifier: None,
@@ -229,22 +238,28 @@ fn build_round_update(
                 .into());
             }
 
-            let new_remaining_requested = current
-                .remaining_requested
-                .saturating_sub(payback_cand.amount);
-            let new_remaining_offered = current
-                .remaining_offered
-                .saturating_sub(remainder_cand.amount);
+            // Saturating subtraction: preserves v1 "round off any
+            // over-fill rather than refuse to apply" semantics. Inputs
+            // are already-validated AssetAmounts so the result is always
+            // <= MAX (`expect` justified).
+            let new_remaining_requested = AssetAmount::new(
+                u64::from(current.remaining_requested).saturating_sub(payback_cand.amount),
+            )
+            .expect("saturating_sub of validated AssetAmount stays within MAX");
+            let new_remaining_offered = AssetAmount::new(
+                u64::from(current.remaining_offered).saturating_sub(remainder_cand.amount),
+            )
+            .expect("saturating_sub of validated AssetAmount stays within MAX");
 
-            // The protocol's `remainder_note` builder takes a typed
-            // `PswapNoteAttachment` and `AssetAmount` newtypes.
-            // Constructions are infallible in practice — `round_depth`
-            // is u32-bounded upstream and `new_remaining_*` are
-            // arithmetic over u64 values already validated to fit in
-            // `AssetAmount` — but we propagate errors for completeness.
+            // Boundary conversion: candidate.amount is u64 (raw word
+            // from the observer) → AssetAmount for the typed builder.
+            let payout_amount =
+                AssetAmount::new(remainder_cand.amount).map_err(crate::ClientError::AssetError)?;
+            let fill_amount =
+                AssetAmount::new(payback_cand.amount).map_err(crate::ClientError::AssetError)?;
+
             let attachment = PswapNoteAttachment::new(
-                AssetAmount::new(remainder_cand.amount)
-                    .map_err(crate::ClientError::AssetError)?,
+                payout_amount,
                 current.order_id(),
                 u32::try_from(round_depth)
                     .map_err(|_| PswapLineageError::Reconstruction(
@@ -253,16 +268,12 @@ fn build_round_update(
                         ),
                     ))?,
             );
-            let new_remaining_offered_a = AssetAmount::new(new_remaining_offered)
-                .map_err(crate::ClientError::AssetError)?;
-            let new_remaining_requested_a = AssetAmount::new(new_remaining_requested)
-                .map_err(crate::ClientError::AssetError)?;
             let remainder_note = original
                 .remainder_note(
                     remainder_cand.sender,
                     &attachment,
-                    new_remaining_offered_a,
-                    new_remaining_requested_a,
+                    new_remaining_offered,
+                    new_remaining_requested,
                 )
                 .map_err(PswapLineageError::Reconstruction)?;
 
@@ -280,8 +291,8 @@ fn build_round_update(
                 order_id: current.order_id(),
                 round_depth,
                 consumer_account_id: payback_cand.sender,
-                fill_amount: payback_cand.amount,
-                payout_amount: remainder_cand.amount,
+                fill_amount,
+                payout_amount,
                 new_remaining_offered,
                 new_remaining_requested,
                 new_state: PswapLineageState::Active,
@@ -504,8 +515,9 @@ mod tests {
             current_tip_note_id: note.id(),
             current_tip_nullifier: note.nullifier(),
             current_depth: 0,
-            remaining_offered: offered,
-            remaining_requested: requested,
+            remaining_offered: AssetAmount::new(offered).expect("test value fits in AssetAmount"),
+            remaining_requested: AssetAmount::new(requested)
+                .expect("test value fits in AssetAmount"),
             last_consumer_account_id: None,
             last_payout_amount: None,
             state: PswapLineageState::Active,
@@ -583,10 +595,10 @@ mod tests {
 
         assert_eq!(update.round_depth, 1);
         assert_eq!(update.consumer_account_id, consumer);
-        assert_eq!(update.fill_amount, fill_amount);
-        assert_eq!(update.payout_amount, payout_amount);
-        assert_eq!(update.new_remaining_offered, new_off);
-        assert_eq!(update.new_remaining_requested, new_req);
+        assert_eq!(update.fill_amount, aa(fill_amount));
+        assert_eq!(update.payout_amount, aa(payout_amount));
+        assert_eq!(update.new_remaining_offered, aa(new_off));
+        assert_eq!(update.new_remaining_requested, aa(new_req));
         assert_eq!(update.new_state, PswapLineageState::Active);
         assert_eq!(update.new_tip_note_id, Some(remainder.id()));
         assert!(update.reconstructed_payback.is_some());
@@ -622,10 +634,10 @@ mod tests {
             .expect("full fill must produce a round update");
 
         assert_eq!(update.new_state, PswapLineageState::FullyFilled);
-        assert_eq!(update.fill_amount, fill_amount);
-        assert_eq!(update.payout_amount, 30); // entire remaining_offered
-        assert_eq!(update.new_remaining_offered, 0);
-        assert_eq!(update.new_remaining_requested, 0);
+        assert_eq!(update.fill_amount, aa(fill_amount));
+        assert_eq!(update.payout_amount, aa(30)); // entire remaining_offered
+        assert_eq!(update.new_remaining_offered, AssetAmount::ZERO);
+        assert_eq!(update.new_remaining_requested, AssetAmount::ZERO);
         assert_eq!(update.new_tip_note_id, None);
         assert_eq!(update.new_tip_nullifier, None);
         assert!(update.reconstructed_remainder.is_none());
@@ -656,15 +668,15 @@ mod tests {
 
         assert_eq!(update.new_state, PswapLineageState::Reclaimed);
         assert_eq!(update.consumer_account_id, creator);
-        assert_eq!(update.fill_amount, 0);
-        assert_eq!(update.payout_amount, 80);
-        assert_eq!(update.new_remaining_offered, 0);
+        assert_eq!(update.fill_amount, AssetAmount::ZERO);
+        assert_eq!(update.payout_amount, aa(80));
+        assert_eq!(update.new_remaining_offered, AssetAmount::ZERO);
         // Regression: the reclaim branch used to write
         // `current.remaining_requested` here, leaving the terminal row
         // with a non-zero `remaining_requested`. The doc on
         // `PswapLineageRoundUpdate::new_remaining_requested` says "0 on
         // full fill / reclaim", and this assert holds the line.
-        assert_eq!(update.new_remaining_requested, 0);
+        assert_eq!(update.new_remaining_requested, AssetAmount::ZERO);
         assert!(update.reconstructed_payback.is_none());
         assert!(update.reconstructed_payback_inclusion_proof.is_none());
     }
@@ -744,8 +756,8 @@ mod tests {
         // Apply in-memory — exactly what `discover_pswap_rounds`'s loop does.
         let record1 = record0.apply_round_in_memory(&update1);
         assert_eq!(record1.current_depth, 1);
-        assert_eq!(record1.remaining_offered, new_off1);
-        assert_eq!(record1.remaining_requested, new_req1);
+        assert_eq!(record1.remaining_offered, aa(new_off1));
+        assert_eq!(record1.remaining_requested, aa(new_req1));
         assert_eq!(record1.current_tip_note_id, remainder1.id());
         assert_eq!(record1.state, PswapLineageState::Active);
 
@@ -760,10 +772,10 @@ mod tests {
 
         assert_eq!(update2.round_depth, 2);
         assert_eq!(update2.new_state, PswapLineageState::FullyFilled);
-        assert_eq!(update2.fill_amount, fill2);
-        assert_eq!(update2.payout_amount, new_off1); // remaining_offered exhausted
-        assert_eq!(update2.new_remaining_offered, 0);
-        assert_eq!(update2.new_remaining_requested, 0);
+        assert_eq!(update2.fill_amount, aa(fill2));
+        assert_eq!(update2.payout_amount, aa(new_off1)); // remaining_offered exhausted
+        assert_eq!(update2.new_remaining_offered, AssetAmount::ZERO);
+        assert_eq!(update2.new_remaining_requested, AssetAmount::ZERO);
 
         // The chain invariant is the whole point of this test: round 2
         // consumed the remainder produced by round 1, not the original.

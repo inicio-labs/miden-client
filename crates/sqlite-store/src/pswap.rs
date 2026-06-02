@@ -101,12 +101,12 @@ impl SqliteStore {
         //    payback is not duplicated; for a private payback this is the
         //    only insertion site, and the included inclusion proof makes
         //    the row directly consumable (see
-        //    `insert_reconstructed_payback_tx`).
-        if let Some(payback_note) = &update.reconstructed_payback {
-            insert_reconstructed_payback_tx(
+        //    `insert_payback_tx`).
+        if let Some(payback_note) = &update.payback {
+            insert_payback_tx(
                 &tx,
                 payback_note,
-                update.reconstructed_payback_inclusion_proof.as_ref(),
+                update.payback_inclusion_proof.as_ref(),
                 update.at_block,
             )?;
         }
@@ -120,7 +120,7 @@ impl SqliteStore {
         //    tag delete cannot leave us with a terminal lineage that is
         //    still paying sync bandwidth.
         if matches!(
-            update.new_state,
+            update.state,
             PswapLineageState::FullyFilled | PswapLineageState::Reclaimed
         ) {
             remove_pswap_asset_pair_tag_tx(&tx, update.order_id)?;
@@ -325,7 +325,7 @@ fn update_lineage_tip_tx(
     let updated_block = update.at_block.as_u32();
     let last_consumer_bytes = update.consumer_account_id.to_bytes();
 
-    let rows_changed = match (update.new_tip_note_id, update.new_tip_nullifier) {
+    let rows_changed = match (update.tip_note_id, update.tip_nullifier) {
         (Some(note_id), Some(nullifier)) => {
             // Active continuation — new tip overwrites the previous one.
             const SQL: &str = "\
@@ -341,11 +341,11 @@ WHERE order_id = ?";
                     note_id.as_word().to_string(),
                     nullifier.to_hex(),
                     update.round_depth,
-                    u64::from(update.new_remaining_offered),
-                    u64::from(update.new_remaining_requested),
+                    u64::from(update.remaining_offered),
+                    u64::from(update.remaining_requested),
                     last_consumer_bytes,
                     u64::from(update.payout_amount),
-                    update.new_state.as_u8(),
+                    update.state.as_u8(),
                     updated_block,
                     order_id_bytes,
                 ])
@@ -362,11 +362,11 @@ WHERE order_id = ?";
             tx.prepare_cached(SQL)
                 .into_store_error()?
                 .execute(params![
-                    u64::from(update.new_remaining_offered),
-                    u64::from(update.new_remaining_requested),
+                    u64::from(update.remaining_offered),
+                    u64::from(update.remaining_requested),
                     last_consumer_bytes,
                     u64::from(update.payout_amount),
-                    update.new_state.as_u8(),
+                    update.state.as_u8(),
                     updated_block,
                     order_id_bytes,
                 ])
@@ -384,7 +384,7 @@ WHERE order_id = ?";
     Ok(())
 }
 
-fn insert_reconstructed_payback_tx(
+fn insert_payback_tx(
     tx: &Transaction<'_>,
     payback_note: &Note,
     inclusion_proof: Option<&miden_client::note::NoteInclusionProof>,
@@ -600,15 +600,15 @@ mod tests {
             consumer_account_id: consumer,
             fill_amount: miden_protocol::asset::AssetAmount::new(10).unwrap(),
             payout_amount: miden_protocol::asset::AssetAmount::new(20).unwrap(),
-            new_remaining_offered: miden_protocol::asset::AssetAmount::new(80).unwrap(),
-            new_remaining_requested: miden_protocol::asset::AssetAmount::new(40).unwrap(),
-            new_state: PswapLineageState::Active,
-            new_tip_note_id: Some(record.current_tip_note_id),
-            new_tip_nullifier: Some(record.current_tip_nullifier),
+            remaining_offered: miden_protocol::asset::AssetAmount::new(80).unwrap(),
+            remaining_requested: miden_protocol::asset::AssetAmount::new(40).unwrap(),
+            state: PswapLineageState::Active,
+            tip_note_id: Some(record.current_tip_note_id),
+            tip_nullifier: Some(record.current_tip_nullifier),
             at_block: BlockNumber::from(8),
-            reconstructed_payback: None,
-            reconstructed_payback_inclusion_proof: None,
-            reconstructed_remainder: None,
+            payback: None,
+            payback_inclusion_proof: None,
+            remainder: None,
         };
         let result = store.apply_pswap_round(&bad).await;
         assert!(result.is_err(), "expected non-monotonic depth to be rejected");
@@ -641,15 +641,15 @@ mod tests {
             consumer_account_id: consumer,
             fill_amount: miden_protocol::asset::AssetAmount::new(10).unwrap(),
             payout_amount: miden_protocol::asset::AssetAmount::new(20).unwrap(),
-            new_remaining_offered: miden_protocol::asset::AssetAmount::new(80).unwrap(),
-            new_remaining_requested: miden_protocol::asset::AssetAmount::new(40).unwrap(),
-            new_state: PswapLineageState::Active,
-            new_tip_note_id: None,
-            new_tip_nullifier: None,
+            remaining_offered: miden_protocol::asset::AssetAmount::new(80).unwrap(),
+            remaining_requested: miden_protocol::asset::AssetAmount::new(40).unwrap(),
+            state: PswapLineageState::Active,
+            tip_note_id: None,
+            tip_nullifier: None,
             at_block: BlockNumber::from(8),
-            reconstructed_payback: None,
-            reconstructed_payback_inclusion_proof: None,
-            reconstructed_remainder: None,
+            payback: None,
+            payback_inclusion_proof: None,
+            remainder: None,
         };
         let result = store.apply_pswap_round(&bogus).await;
         assert!(result.is_err(), "expected unknown order_id to be rejected");

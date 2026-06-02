@@ -218,45 +218,31 @@ pub struct PswapLineageRoundUpdate {
     /// the remainder's attachment word slot `[0]`; equals
     /// `previous_remaining_offered` for a terminal full-fill or a reclaim.
     pub payout_amount: AssetAmount,
-    /// `previous_remaining_offered - payout_amount` (0 on full fill /
-    /// reclaim).
-    pub new_remaining_offered: AssetAmount,
-    /// `previous_remaining_requested - fill_amount` (0 on full fill /
-    /// reclaim).
-    pub new_remaining_requested: AssetAmount,
-    /// Terminal state after this round — `Active` if a new remainder was
-    /// produced, `FullyFilled` if the requested side was exhausted, or
-    /// `Reclaimed` if the consumer is the creator and no outputs were
-    /// emitted.
-    pub new_state: PswapLineageState,
-    /// Identity of the new tip (the remainder). `None` for terminal states.
-    pub new_tip_note_id: Option<NoteId>,
-    /// Nullifier of the new tip. `None` for terminal states.
-    pub new_tip_nullifier: Option<Nullifier>,
-    /// Block number in which the previous tip was consumed.
+    /// Remaining offered-asset units AFTER this round (0 on full fill / reclaim).
+    pub remaining_offered: AssetAmount,
+    /// Remaining requested-asset units AFTER this round (0 on full fill / reclaim).
+    pub remaining_requested: AssetAmount,
+    /// Lineage state AFTER this round: `Active` if a remainder was emitted,
+    /// `FullyFilled` if requested side exhausted, `Reclaimed` if consumer == creator
+    /// with no outputs.
+    pub state: PswapLineageState,
+    /// Identity of the new tip (the remainder). `None` for terminal rounds.
+    pub tip_note_id: Option<NoteId>,
+    /// Nullifier of the new tip. `None` for terminal rounds.
+    pub tip_nullifier: Option<Nullifier>,
+    /// Block in which the previous tip was consumed.
     pub at_block: BlockNumber,
-    /// Reconstructed payback note built via [`PswapNote::payback_note`]. The
-    /// correlator verified `reconstructed.id() == observed.note_id` before
-    /// emitting this update. The store inserts this into `input_notes`
-    /// (idempotent on `note_id` PK) so the creator's normal consume flow
-    /// finds it. `None` only on a reclaim, where no payback is emitted.
-    pub reconstructed_payback: Option<Note>,
-    /// Inclusion proof of the payback note in the block where it was
-    /// emitted. Threaded all the way from
-    /// `PswapChainObserver::observe` (which captures it from the
-    /// `CommittedNote` it sees during sync) so the store can insert
-    /// the reconstructed payback in `Unverified` state — ready for
-    /// the normal sync state-promotion path. Without it the payback
-    /// would land in `Expected` state forever, since the default
-    /// `NoteScreener` Discards private notes it does not already
-    /// track and so never sees the payback again on a subsequent sync.
-    /// `None` exactly when `reconstructed_payback.is_none()` —
-    /// i.e. for reclaim rounds.
-    pub reconstructed_payback_inclusion_proof: Option<NoteInclusionProof>,
-    /// Reconstructed remainder note built via [`PswapNote::remainder_note`].
-    /// The correlator verified its `note_id` matched. `None` on terminal
-    /// states. Retained for diagnostics; not persisted directly.
-    pub reconstructed_remainder: Option<Note>,
+    /// Reconstructed payback note (verified against the observed note id).
+    /// Inserted into `input_notes` so the creator's normal consume flow finds it.
+    /// `None` only on a reclaim round.
+    pub payback: Option<Note>,
+    /// Inclusion proof for `payback`. Threaded so the store can insert the
+    /// payback in `Unverified` state (skips the Expected-state limbo that
+    /// would otherwise strand a private payback). `None` iff `payback.is_none()`.
+    pub payback_inclusion_proof: Option<NoteInclusionProof>,
+    /// Reconstructed remainder note (verified against the observed note id).
+    /// Diagnostic only — not persisted. `None` for terminal rounds.
+    pub remainder: Option<Note>,
 }
 
 // PSWAP LINEAGE FILTER

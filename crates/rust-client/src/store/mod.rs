@@ -715,7 +715,7 @@ pub trait Store: Send + Sync {
     ///    fail-loud condition.
     /// 2. Update the matching `pswap_lineages` row — tip, depth,
     ///    remaining_*, last_consumer / last_payout, state, updated_at_block.
-    /// 3. If `update.reconstructed_payback.is_some()`, insert that note
+    /// 3. If `update.payback.is_some()`, insert that note
     ///    into `input_notes` with `INSERT OR IGNORE` semantics on the
     ///    `note_id` PK. For a *public* payback the default `NoteScreener`
     ///    will already have inserted the row in `Committed` state with a

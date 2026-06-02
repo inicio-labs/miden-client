@@ -79,18 +79,12 @@ pub enum NoteTagSource {
     Note(NoteDetailsCommitment),
     /// Tag manually added by the user.
     User,
-    /// Tag owned by a feature subsystem's subscription. The feature
-    /// inserts this row when the subscription begins and removes it
-    /// when the subscription terminates. The `Felt` is the per-
-    /// subscription identifier — chosen by the feature; only needs to
-    /// be unique within that feature's subscriptions so that two
-    /// concurrent subscriptions sharing the same `tag` end up as two
-    /// distinct rows (composite-key `(tag, source)` reference counting).
-    ///
-    /// Today's user: PSWAP chain tracking uses the originating order's
-    /// `order_id` (= `serial[1]` of the original PSWAP) as the key.
-    /// Any future feature with a subscribe/unsubscribe lifecycle can
-    /// reuse this variant by picking its own Felt-keyed scheme.
+    /// Tag added by a feature subsystem for the duration of a subscription
+    /// lifecycle (inserted on subscribe, removed on unsubscribe). The `Felt`
+    /// is a feature-chosen key — only needs to be unique within that
+    /// feature so concurrent subscriptions sharing a tag deduplicate via
+    /// the `(tag, source)` composite key. Currently used by PSWAP chain
+    /// tracking with `order_id` as the key.
     Subscription(Felt),
 }
 
@@ -137,8 +131,7 @@ impl Serializable for NoteTagSource {
                 details_commitment.write_into(target);
             },
             NoteTagSource::User => target.write_u8(2),
-            // Discriminant 3 — appended after the existing variants to keep
-            // every pre-Subscription row deserialising unchanged. Do not renumber.
+            // Discriminant 3 must remain stable for pre-Subscription row compatibility.
             NoteTagSource::Subscription(key) => {
                 target.write_u8(3);
                 key.write_into(target);

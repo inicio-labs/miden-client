@@ -1,6 +1,4 @@
 //! Errors specific to PSWAP chain tracking.
-//!
-//! See module-level docs on [`crate::pswap`].
 
 use alloc::string::String;
 
@@ -12,85 +10,47 @@ use super::lineage::PswapLineageState;
 use crate::store::StoreError;
 
 /// Failures raised by the PSWAP chain-tracking subsystem.
-///
-/// Variants split into three groups:
-///
-/// 1. Lookup / state-transition failures the caller may reasonably handle
-///    (`NotFound`, `NotActive`).
-/// 2. Reconstruction / persistence failures from the protocol or store
-///    layers (`Reconstruction`, `Store`).
-/// 3. Defensive integrity violations that indicate a protocol bug or
-///    corrupted local state (`UnknownState`, `InconsistentRow`,
-///    `CommitmentMismatch`). These should be loud — see the variant docs
-///    for the corruption-vs-protocol-bug distinction.
-///
-/// Conversion to [`ClientError`] is `From`-based so call sites can use `?`
-/// without manual wrapping.
 #[derive(Debug, thiserror::Error)]
 pub enum PswapLineageError {
-    /// No `pswap_lineages` row with the given `order_id`. Caller likely
-    /// passed an order this client did not originate, or a typo.
+    /// No `pswap_lineages` row with the given `order_id`.
     #[error("no PSWAP lineage tracked for order_id {0}")]
     NotFound(Felt),
 
-    /// The lineage exists but is no longer `Active` — i.e. it was already
-    /// `FullyFilled` or `Reclaimed`. The terminal state is included for
-    /// diagnostics.
+    /// The lineage exists but is already in a terminal state.
     #[error("PSWAP lineage is not active (state = {0:?}); no further rounds expected")]
     NotActive(PswapLineageState),
 
-    /// The lineage's recorded creator is not one of this client's local
-    /// accounts. Reclaim requires the creator's signing authority, so
-    /// it cannot be issued from this wallet. Surfaced explicitly (rather
-    /// than failing later at sign time) so service-style wallets that
-    /// track PSWAPs they submitted on behalf of clients get a clear
-    /// error instead of an opaque signing failure.
+    /// The lineage's creator is not a local account — reclaim requires
+    /// the creator's signing authority.
     #[error("PSWAP creator account {0} is not local; reclaim requires the creator's signing authority")]
     CreatorNotLocal(AccountId),
 
-    /// The current tip stored on the lineage row is missing from the
-    /// expected store table. Implies a desync between `pswap_lineages` and
-    /// `output_notes` (for depth 0) or a programming error in
-    /// `apply_pswap_round`.
+    /// The current tip is missing from the store — `pswap_lineages` is
+    /// out of sync with `output_notes`/`input_notes`.
     #[error("current tip note is missing from the local store; pswap_lineages is out of sync")]
     TipMissing,
 
-    /// The reconstruction call to [`miden_standards::note::PswapNote::payback_note`]
-    /// or [`miden_standards::note::PswapNote::remainder_note`] failed. The
-    /// inner `NoteError` carries the protocol-layer reason. Indicates either
-    /// a protocol/client version mismatch or corrupted lineage inputs.
+    /// `PswapNote::payback_note` / `remainder_note` reconstruction failed.
     #[error("PSWAP note reconstruction failed: {0}")]
     Reconstruction(#[source] NoteError),
 
-    /// A reconstructed note's commitment / ID did not match the on-chain
-    /// note we observed. This is a *fail-loud* condition — the protocol
-    /// guarantees byte-identical reconstruction (see
-    /// `pswap_creator_reconstructs_lineage_from_attachments` in the
-    /// protocol's test suite). A mismatch means we are running against a
-    /// protocol version whose helpers disagree with the on-chain script,
-    /// or the lineage row is corrupted; either way, silently advancing the
-    /// lineage would corrupt future state.
+    /// Reconstructed note id doesn't match the observed id — fail-loud
+    /// (protocol/client version skew or row corruption).
     #[error(
         "reconstructed PSWAP note id {reconstructed} does not match observed id {observed}; \
          lineage round skipped to avoid corruption (protocol/client version skew or row corruption)"
     )]
     CommitmentMismatch { reconstructed: String, observed: String },
 
-    /// The SQLite backend read a `state` byte that does not correspond to
-    /// any defined [`super::lineage::PswapLineageState`] variant. Implies a
-    /// forward-incompatible schema version.
+    /// SQLite read a `state` byte with no matching [`PswapLineageState`] variant.
     #[error("unknown PSWAP lineage state byte: {0}")]
     UnknownState(u8),
 
-    /// Defensive: a stored row's columns are mutually inconsistent — e.g.
-    /// `last_consumer_account_id` is `NULL` while `current_depth > 0`.
-    /// Indicates corruption or a bug in `apply_pswap_round`.
+    /// A stored row's columns are mutually inconsistent.
     #[error("PSWAP lineage row is internally inconsistent: {0}")]
     InconsistentRow(String),
 
-    /// Propagated from the store layer. Kept as a distinct variant rather
-    /// than collapsing into `ClientError` so callers can match specifically
-    /// on PSWAP store failures.
+    /// Propagated from the store layer.
     #[error(transparent)]
     Store(#[from] StoreError),
 }

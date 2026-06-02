@@ -179,9 +179,8 @@ pub struct StateSync {
     /// Number of blocks after which pending transactions are considered stale and discarded.
     /// If `None`, there is no limit and transactions will be kept indefinitely.
     tx_discard_delta: Option<u32>,
-    /// Whether to check for nullifiers during state sync. When enabled, the component will query
-    /// the nullifiers for unspent notes at each sync step. This allows to detect when tracked
-    /// notes have been consumed externally and discard local transactions that depend on them.
+    /// If true, queries the node for consumption of tracked unspent-note nullifiers
+    /// each sync and discards local transactions whose inputs were nullified.
     sync_nullifiers: bool,
 }
 

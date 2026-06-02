@@ -1,51 +1,25 @@
-//! PSWAP chain tracking for partial swap orders this client originated.
+//! PSWAP chain tracking — follows partial-swap orders across fills by
+//! foreign accounts so the creator can always see the current tip and
+//! reclaim the unfilled balance.
 //!
-//! ## What this module does
+//! ### Flow
 //!
-//! A PSWAP (partial swap) note lets a creator post an offer that anyone can fill
-//! incrementally. Each fill consumes the current "tip" PSWAP note and emits, in
-//! the same transaction, a P2ID payback to the creator and a remainder PSWAP for
-//! the still-unfilled portion. The remainder becomes the new tip; the chain
-//! continues until fully filled or reclaimed by the creator.
+//! 1. `build_pswap_create` submission → [`PswapLineageRecord`] row + asset-pair
+//!    tag subscription so sync delivers future remainders.
+//! 2. `Client::sync_state` → [`PswapChainObserver`] collects PSWAP-attachment
+//!    notes; [`discover_pswap_rounds`] joins them with consumed-nullifier
+//!    events from the same sync and emits one [`PswapLineageRoundUpdate`] per
+//!    advanced round, each applied atomically by the store.
+//! 3. Reclaim → [`Client::build_pswap_cancel_by_order`] reconstructs the
+//!    current tip via `PswapNote::remainder_note` and delegates to
+//!    `build_pswap_cancel`.
 //!
-//! Today the client tracks only the transaction it submits — once a foreign
-//! account fills the order, the creator loses sight of the chain. This module
-//! adds a persistent lineage table plus a sync-time chain walker that follows
-//! the order across arbitrarily many fills by other accounts, exposing each
-//! round's state (current tip, remaining amounts, depth) and surfacing each
-//! payback as a consumable input note in the local store.
+//! Submodules: [`lineage`] (types), [`observer`] (per-note collector),
+//! [`discovery`] (post-sync correlator), [`errors`].
 //!
-//! ## How it fits into the existing flow
-//!
-//! - On `build_pswap_create` submission, a [`PswapLineageRecord`] row is
-//!   inserted into the new `pswap_lineages` table. The asset-pair tag is
-//!   registered so sync can pick up future remainder notes.
-//! - During [`crate::Client::sync_state`], a [`PswapChainObserver`] (an
-//!   implementation of [`crate::sync::NoteObserver`]) inspects every incoming
-//!   note for a PSWAP attachment. Notes whose `order_id` matches a tracked
-//!   active lineage are pushed into a per-sync collector.
-//! - After the network sync returns, [`discover_pswap_rounds`] joins the
-//!   collected notes with the consumed-nullifier signal from the same sync to
-//!   advance each lineage by one or more rounds. Each round produces a
-//!   [`PswapLineageRoundUpdate`] that's applied atomically by the store.
-//! - For reclaim, [`Client::build_pswap_cancel_by_order`] reconstructs the
-//!   current tip via `PswapNote::remainder_note(...)` and delegates to the
-//!   existing `build_pswap_cancel` builder.
-//!
-//! ## Module layout
-//!
-//! - [`lineage`] — types describing the persistent lineage record and a
-//!   round transition.
-//! - [`observer`] — the per-note observer that filters PSWAP-attachment notes
-//!   for active lineages.
-//! - [`discovery`] — the post-sync correlator that builds round updates.
-//! - [`errors`] — error types specific to PSWAP chain tracking.
-//!
-//! The protocol-side `PswapNote` invariants this subsystem relies on
-//! (one payback + at most one remainder per round; attachment word
-//! layout `[amount, order_id, depth, 0]`; deterministic remainder
-//! reconstruction from `(consumer, attachment, remaining_*)`) are
-//! documented in `miden_standards::note::PswapNote`.
+//! Protocol-side invariants (≤1 payback + ≤1 remainder per round, attachment
+//! word layout, deterministic reconstruction) live on
+//! `miden_standards::note::PswapNote`.
 
 pub mod discovery;
 pub mod errors;
@@ -69,47 +43,17 @@ use crate::transaction::TransactionResult;
 use crate::{Client, transaction::notes_from_output};
 
 impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
-    /// Records any new PSWAP orders this transaction created as
-    /// [`PswapLineageRecord`] rows in the store, and registers the
-    /// matching asset-pair tag so future remainders are delivered via
-    /// sync.
+    /// For each PSWAP this wallet just submitted (any output where
+    /// `PswapNote::try_from(note)` succeeds AND `parent_depth == 0`),
+    /// inserts a [`PswapLineageRecord`] and subscribes the asset-pair
+    /// tag so sync delivers future remainders. Idempotent (upsert on
+    /// `order_id` + `(tag, source)` insert).
     ///
-    /// Called by `apply_transaction_update` immediately after the
-    /// transaction has been persisted to the store. Idempotent: an
-    /// upsert on `order_id` plus a tag-source insert that's also
-    /// idempotent on its `(tag, source)` row. Safe to retry; safe to
-    /// no-op (the common case — the transaction is not a
-    /// `build_pswap_create`).
-    ///
-    /// ### Filter criteria
-    ///
-    /// An output note becomes a tracked lineage iff:
-    ///   * `PswapNote::try_from(&note)` succeeds — the note is a PSWAP
-    ///     (cheap, fails fast for non-PSWAP outputs), AND
-    ///   * `pswap.parent_depth() == 0` — it's the originating order,
-    ///     not a remainder this client happened to emit while filling
-    ///     someone else's PSWAP.
-    ///
-    /// **The lineage's `creator` field is NOT filtered.** Every PSWAP
-    /// this wallet submits is tracked, regardless of whether the
-    /// configured `creator_account_id` is one of our local accounts.
-    /// This supports service-style wallets that build PSWAPs on behalf
-    /// of clients — they get full chain visibility even though they
-    /// cannot themselves reclaim. The reclaim entry point
-    /// ([`Self::build_pswap_cancel_by_order`]) surfaces a clear
-    /// `CreatorNotLocal` error for these lineages.
-    ///
-    /// Trade-off: in the (rare) case of a wallet that submits PSWAPs
-    /// for non-local creators on a high-volume cadence (e.g. faucet
-    /// experimentation), this produces lineage rows that can't be
-    /// reclaimed locally. The cost is bounded (small rows + asset-pair
-    /// tag subscriptions); the alternative ("filter by local creator")
-    /// would silently lose visibility for the service case AND require
-    /// a `get_account_ids()` DB round-trip on every transaction this
-    /// client applies (most of which produce no PSWAPs at all).
-    ///
-    /// Multiple PSWAP creates in a single transaction (unusual but not
-    /// prohibited by protocol) produce one row each.
+    /// Tracks regardless of the PSWAP's `creator_account_id` — service-
+    /// style wallets that submit PSWAPs for remote clients get chain
+    /// visibility. Reclaim ([`Self::build_pswap_cancel_by_order`])
+    /// surfaces `CreatorNotLocal` when reclaim isn't possible from this
+    /// wallet.
     pub(crate) async fn record_created_pswap_lineages(
         &self,
         tx_result: &TransactionResult,

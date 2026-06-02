@@ -183,6 +183,7 @@ fn build_round_update(
                 payback: None,
                 payback_inclusion_proof: None,
                 remainder: None,
+                remainder_inclusion_proof: None,
             }))
         },
         1 => {
@@ -218,6 +219,7 @@ fn build_round_update(
                 payback: Some(payback),
                 payback_inclusion_proof: Some(candidate.inclusion_proof.clone()),
                 remainder: None,
+                remainder_inclusion_proof: None,
             }))
         },
         2 => {
@@ -302,6 +304,7 @@ fn build_round_update(
                 payback: Some(payback_note),
                 payback_inclusion_proof: Some(payback_cand.inclusion_proof.clone()),
                 remainder: Some(remainder_note),
+                remainder_inclusion_proof: Some(remainder_cand.inclusion_proof.clone()),
             }))
         },
         n => {

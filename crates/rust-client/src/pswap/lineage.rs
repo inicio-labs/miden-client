@@ -241,8 +241,16 @@ pub struct PswapLineageRoundUpdate {
     /// would otherwise strand a private payback). `None` iff `payback.is_none()`.
     pub payback_inclusion_proof: Option<NoteInclusionProof>,
     /// Reconstructed remainder note (verified against the observed note id).
-    /// Diagnostic only — not persisted. `None` for terminal rounds.
+    /// Inserted into `input_notes` by `apply_pswap_round` so the remainder's
+    /// nullifier is tracked by the standard nullifier-sync mechanism — needed
+    /// for round N+1 detection, especially for private PSWAPs where the
+    /// default `NoteScreener` doesn't pick the remainder up via the asset-pair
+    /// tag. `None` for terminal rounds.
     pub remainder: Option<Note>,
+    /// Inclusion proof for `remainder`. Threaded so the store can insert the
+    /// remainder in `Unverified` state (same rationale as
+    /// `payback_inclusion_proof`). `None` iff `remainder.is_none()`.
+    pub remainder_inclusion_proof: Option<NoteInclusionProof>,
 }
 
 // PSWAP LINEAGE FILTER

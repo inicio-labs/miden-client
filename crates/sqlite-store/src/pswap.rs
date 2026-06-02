@@ -95,18 +95,34 @@ impl SqliteStore {
         // 1. Mutate the lineage row in place.
         update_lineage_tip_tx(&tx, &update)?;
 
-        // 2. Insert the reconstructed payback (if any). The note table
-        //    upsert routes through INSERT OR REPLACE keyed by `note_id` so
-        //    the default `NoteScreener`'s prior insertion for a public
-        //    payback is not duplicated; for a private payback this is the
-        //    only insertion site, and the included inclusion proof makes
-        //    the row directly consumable (see
-        //    `insert_payback_tx`).
+        // 2a. Insert the reconstructed payback (if any). See
+        //     `insert_pswap_round_note_tx` for the "skip if already present"
+        //     rationale (protects the screener's richer Committed row for
+        //     public notes; the only insertion site for private notes).
         if let Some(payback_note) = &update.payback {
-            insert_payback_tx(
+            insert_pswap_round_note_tx(
                 &tx,
                 payback_note,
                 update.payback_inclusion_proof.as_ref(),
+                update.at_block,
+            )?;
+        }
+
+        // 2b. Insert the reconstructed remainder (if any) — mirrors the
+        //     payback handling. The remainder is the lineage's NEW TIP;
+        //     its nullifier must be in `unspent_nullifiers()` for
+        //     standard nullifier sync to detect round N+1's consumption.
+        //     The default `NoteScreener` covers this for PUBLIC PSWAPs
+        //     via the asset-pair tag, but for PRIVATE PSWAPs the screener
+        //     cannot inspect the content and Discards. The explicit
+        //     insert here is the belt-and-suspenders mechanism so private-
+        //     PSWAP round detection works at depth 2+ (depth 1 still
+        //     blocked by the observer stub; see `pswap/observer.rs`).
+        if let Some(remainder_note) = &update.remainder {
+            insert_pswap_round_note_tx(
+                &tx,
+                remainder_note,
+                update.remainder_inclusion_proof.as_ref(),
                 update.at_block,
             )?;
         }
@@ -384,30 +400,31 @@ WHERE order_id = ?";
     Ok(())
 }
 
-fn insert_payback_tx(
+/// Inserts a reconstructed PSWAP-round note (payback or remainder) into
+/// `input_notes`, skipping if a row already exists for the same `note_id`.
+///
+/// Why skip-if-present rather than upsert: for **public** notes the default
+/// `NoteScreener` will already have inserted this `note_id` in `Committed`
+/// state earlier in the same sync round, with a valid inclusion proof. The
+/// downstream `upsert_input_note_tx` is `INSERT OR REPLACE`, so calling it
+/// unconditionally would downgrade the screener's `Committed` row back to
+/// `Unverified` — the note would not be consumable until the next sync
+/// re-upgraded it. For **private** notes the screener Discards and there
+/// is no prior row, so this is the only insertion site.
+///
+/// Attachments are taken from the note itself: a payback is a P2ID with no
+/// attachments (`NoteAttachments::default()`); a remainder is a PSWAP
+/// carrying its own attachment word.
+fn insert_pswap_round_note_tx(
     tx: &Transaction<'_>,
-    payback_note: &Note,
+    note: &Note,
     inclusion_proof: Option<&miden_client::note::NoteInclusionProof>,
     at_block: BlockNumber,
 ) -> Result<(), StoreError> {
     use miden_client::store::InputNoteRecord;
     use miden_client::store::input_note_states::{ExpectedNoteState, UnverifiedNoteState};
 
-    // IDEMPOTENT INSERT (the trait doc says "INSERT OR IGNORE"). For a
-    // *public* payback the default `NoteScreener` will already have
-    // inserted this `note_id` in `Committed` state earlier in the same
-    // sync round, with a valid inclusion proof. The downstream
-    // `upsert_input_note_tx` is `INSERT OR REPLACE`, so calling it
-    // unconditionally here would downgrade the screener's `Committed`
-    // row back to `Expected` / `Unverified` (no proof) — the note
-    // would not be consumable until the next sync re-upgraded it.
-    //
-    // The right semantics is "skip if a row already exists for this
-    // note_id." For a private payback the screener Discards and there
-    // is no prior row, so this is the only insertion site. For a
-    // public payback the screener's row is already richer than ours;
-    // leave it.
-    let note_id_text = payback_note.id().as_word().to_string();
+    let note_id_text = note.id().as_word().to_string();
     const EXISTS_SQL: &str = "SELECT 1 FROM input_notes WHERE note_id = ?";
     let already_present: bool = tx
         .prepare_cached(EXISTS_SQL)
@@ -418,29 +435,21 @@ fn insert_payback_tx(
         return Ok(());
     }
 
-    let metadata = payback_note.metadata().clone();
-    let details = miden_client::note::NoteDetails::from(payback_note.clone());
+    let metadata = note.metadata().clone();
+    let details = miden_client::note::NoteDetails::from(note.clone());
+    let attachments = note.attachments().clone();
 
-    // Prefer `Unverified` state — it carries the inclusion proof, which
-    // the sync state-promotion path turns into `Committed` on the next
-    // run without needing to re-fetch the note from the node. Falls
-    // back to `Expected` only if the correlator could not supply a
-    // proof (reclaim rounds emit no payback, so this branch is
-    // currently unreachable in practice, but the fallback keeps the
-    // function total).
-    // The reconstructed payback is a P2ID (no PSWAP-style attachment word),
-    // so it carries no attachments.
-    let attachments = miden_protocol::note::NoteAttachments::default();
+    // Prefer `Unverified` state — it carries the inclusion proof, which the
+    // sync state-promotion path turns into `Committed` on the next run
+    // without re-fetching from the node. Fall back to `Expected` if no
+    // proof was supplied (defensive only — reclaim emits no notes so this
+    // function isn't called on reclaim rounds).
     let record = match inclusion_proof {
         Some(proof) => InputNoteRecord::new(
             details,
-            attachments.clone(),
+            attachments,
             None,
-            UnverifiedNoteState {
-                metadata,
-                inclusion_proof: proof.clone(),
-            }
-            .into(),
+            UnverifiedNoteState { metadata, inclusion_proof: proof.clone() }.into(),
         ),
         None => {
             let state = ExpectedNoteState {
@@ -609,6 +618,7 @@ mod tests {
             payback: None,
             payback_inclusion_proof: None,
             remainder: None,
+            remainder_inclusion_proof: None,
         };
         let result = store.apply_pswap_round(&bad).await;
         assert!(result.is_err(), "expected non-monotonic depth to be rejected");
@@ -650,6 +660,7 @@ mod tests {
             payback: None,
             payback_inclusion_proof: None,
             remainder: None,
+            remainder_inclusion_proof: None,
         };
         let result = store.apply_pswap_round(&bogus).await;
         assert!(result.is_err(), "expected unknown order_id to be rejected");

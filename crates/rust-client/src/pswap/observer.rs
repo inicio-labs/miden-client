@@ -86,14 +86,14 @@ pub struct PswapChainObserver {
 }
 
 impl PswapChainObserver {
-    /// Builds an observer wired to the given store and collector. The
-    /// caller (`Client::sync_state`) owns the collector so it can drain
-    /// it after `StateSync::sync_state` returns.
-    pub fn new(
-        store: Arc<dyn Store>,
-        chain_note_updates: Arc<RwLock<Vec<PswapChainNoteUpdate>>>,
-    ) -> Self {
-        Self { store, chain_note_updates }
+    /// Builds an observer wired to the given store. The per-sync collector
+    /// is private to the observer — populated by [`Self::observe`] and
+    /// drained by [`Self::apply`] from inside the same instance.
+    pub fn new(store: Arc<dyn Store>) -> Self {
+        Self {
+            store,
+            chain_note_updates: Arc::new(RwLock::new(Vec::new())),
+        }
     }
 }
 
@@ -147,6 +147,36 @@ impl NoteObserver for PswapChainObserver {
         };
 
         self.chain_note_updates.write().push(update);
+        Ok(())
+    }
+
+    /// Drains the per-sync collector, runs `discover_pswap_rounds` against
+    /// the sync update's nullifier window + collected notes, and applies
+    /// each resulting round update via `Store::apply_pswap_round`. Per-round
+    /// failures are logged but do not abort remaining rounds — one corrupted
+    /// lineage cannot stall the rest of the wallet's PSWAP progress.
+    async fn apply(
+        &self,
+        sync_update: &crate::sync::StateSyncUpdate,
+    ) -> Result<(), ClientError> {
+        let chain_note_updates = core::mem::take(&mut *self.chain_note_updates.write());
+        let round_updates = crate::pswap::discovery::discover_pswap_rounds(
+            self.store.clone(),
+            sync_update,
+            &chain_note_updates,
+        )
+        .await?;
+
+        for round_update in round_updates {
+            if let Err(err) = self.store.apply_pswap_round(&round_update).await {
+                tracing::warn!(
+                    order_id = round_update.order_id.as_canonical_u64(),
+                    round_depth = round_update.round_depth,
+                    error = ?err,
+                    "apply_pswap_round failed; lineage left at previous tip",
+                );
+            }
+        }
         Ok(())
     }
 }

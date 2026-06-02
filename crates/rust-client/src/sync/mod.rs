@@ -69,9 +69,8 @@ use miden_tx::auth::TransactionAuthenticator;
 use miden_tx::utils::serde::{Deserializable, DeserializationError, Serializable};
 use tracing::{debug, info};
 
-use crate::pswap::{PswapChainNoteUpdate, PswapChainObserver};
+use crate::pswap::PswapChainObserver;
 use crate::store::{NoteFilter, TransactionFilter};
-use crate::utils::RwLock;
 use crate::{Client, ClientError};
 mod block_header;
 
@@ -127,24 +126,14 @@ where
         self.ensure_genesis_in_place().await?;
         self.ensure_rpc_limits_in_place().await?;
 
-        // Per-sync PSWAP chain-tracking collector. Shared between the
-        // observer attached to `StateSync` (which pushes during the
-        // network round) and the post-sync correlator (which drains
-        // after `StateSync::sync_state` returns). The Arc + RwLock
-        // pattern matches `crate::utils::RwLock` and gives us a
-        // no-std-friendly handle; contention is non-existent in
-        // practice because the two phases run sequentially on the
-        // same async task.
-        let pswap_chain_note_updates = Arc::new(RwLock::new(Vec::<PswapChainNoteUpdate>::new()));
-
-        // Build sync state components
+        // Build sync state components. Each `NoteObserver` owns its own
+        // per-sync collector internally and drives its own post-sync work
+        // via `apply()` — no orchestration plumbing needed here beyond
+        // attach + dispatch.
         let note_screener = self.note_screener();
         let state_sync =
             StateSync::new(self.rpc_api.clone(), Arc::new(note_screener), self.tx_discard_delta)
-                .with_note_observer(Arc::new(PswapChainObserver::new(
-                    self.store.clone(),
-                    pswap_chain_note_updates.clone(),
-                )));
+                .with_note_observer(Arc::new(PswapChainObserver::new(self.store.clone())));
         let input = self.build_sync_input().await?;
 
         let mut partial_mmr = self.get_current_partial_mmr().await?;
@@ -155,20 +144,11 @@ where
         let sync_summary: SyncSummary = (&state_sync_update).into();
         debug!(sync_summary = ?sync_summary, "Sync summary computed");
 
-        // Run the PSWAP correlator before persisting the sync update,
-        // so the lineage round updates produced are computed against
-        // the same in-memory view of the sync window that the
-        // observer just populated. The correlator is a pure function
-        // of `(state_sync_update, chain_note_updates, store)`; it
-        // does not mutate anything until `apply_pswap_round` runs
-        // below.
-        let chain_note_updates = core::mem::take(&mut *pswap_chain_note_updates.write());
-        let lineage_round_updates = crate::pswap::discovery::discover_pswap_rounds(
-            self.store.clone(),
-            &state_sync_update,
-            &chain_note_updates,
-        )
-        .await?;
+        // Run each attached observer's post-sync `apply()` hook against
+        // the in-memory sync update, BEFORE persisting it. Per-observer
+        // failures are logged inside the dispatcher; this call doesn't
+        // propagate apply-side errors.
+        state_sync.run_apply_hooks(&state_sync_update).await?;
 
         info!("Applying changes to the store.");
 
@@ -177,24 +157,6 @@ where
             .apply_state_sync(state_sync_update)
             .await
             .map_err(ClientError::StoreError)?;
-
-        // Apply each lineage round update inside its own SQL
-        // transaction (`apply_pswap_round` enforces atomicity and the
-        // monotonic-depth invariant — see commit 53902048). One
-        // failure does not abort the rest: a per-round error here is
-        // surfaced via `tracing::warn!` and the remaining rounds
-        // continue to apply, so a single corrupted lineage cannot
-        // stall the whole client's sync progress.
-        for round_update in lineage_round_updates {
-            if let Err(err) = self.store.apply_pswap_round(&round_update).await {
-                tracing::warn!(
-                    order_id = round_update.order_id.as_canonical_u64(),
-                    round_depth = round_update.round_depth,
-                    error = ?err,
-                    "apply_pswap_round failed; lineage left at previous tip",
-                );
-            }
-        }
 
         // Cache MMR so pruning can reuse in-memory MMR.
         self.cache_partial_mmr(partial_mmr).await?;

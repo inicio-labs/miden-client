@@ -240,6 +240,28 @@ impl StateSync {
         self.sync_nullifiers = true;
     }
 
+    /// Runs each attached observer's `apply()` hook against `state_sync_update`.
+    /// Called by the orchestrator after [`Self::sync_state`] returns but
+    /// before the caller persists the sync update. Per-observer failures are
+    /// logged (tagged with the observer's [`NoteObserver::name`]) and never
+    /// abort the rest of the pass — symmetric with the per-note `observe()`
+    /// dispatcher.
+    pub async fn run_apply_hooks(
+        &self,
+        state_sync_update: &StateSyncUpdate,
+    ) -> Result<(), ClientError> {
+        for observer in &self.note_observers {
+            if let Err(err) = observer.apply(state_sync_update).await {
+                tracing::warn!(
+                    observer = observer.name(),
+                    error = ?err,
+                    "NoteObserver::apply failed; continuing with remaining observers",
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Syncs the state of the client with the chain tip of the node, returning the updates that
     /// should be applied to the store.
     ///

@@ -11,6 +11,7 @@ use async_trait::async_trait;
 
 use crate::ClientError;
 use crate::rpc::domain::note::CommittedNote;
+use crate::sync::StateSyncUpdate;
 
 /// Side-effect-only observer of note arrivals during sync.
 ///
@@ -33,4 +34,17 @@ pub trait NoteObserver {
     /// after the screener verdict. Return `Ok(())` for the "not
     /// interested" case; reserve `Err(_)` for genuine internal failures.
     async fn observe(&self, committed_note: &CommittedNote) -> Result<(), ClientError>;
+
+    /// Post-sync hook. Invoked by [`crate::sync::StateSync::run_apply_hooks`]
+    /// once per sync, with the completed [`StateSyncUpdate`] by reference.
+    /// Observers drain any per-sync collector populated by
+    /// [`Self::observe`] and apply their feature-specific post-sync work
+    /// (e.g. running a correlator, writing feature-specific store rows).
+    ///
+    /// Default impl is a no-op for simple observers that only need
+    /// per-note hooks. Errors are logged via the dispatcher and never
+    /// abort the rest of the apply pass.
+    async fn apply(&self, _sync_update: &StateSyncUpdate) -> Result<(), ClientError> {
+        Ok(())
+    }
 }

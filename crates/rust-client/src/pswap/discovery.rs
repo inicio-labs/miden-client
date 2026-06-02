@@ -54,8 +54,19 @@ pub async fn discover_pswap_rounds(
         return Ok(Vec::new());
     }
 
-    let active = store.list_pswap_lineages(PswapLineageFilter::Active).await?;
-    if active.is_empty() {
+    // Load only lineages whose tip nullifier appears in this sync window —
+    // skips the "scan every active lineage" cost when activity is sparse.
+    // The inner same-block multi-fill loop below handles subsequent rounds
+    // for each loaded lineage via in-memory advancement.
+    let consumed_nullifiers: Vec<Nullifier> = state_sync_update
+        .current_window_nullifier_blocks
+        .iter()
+        .map(|(nullifier, _)| *nullifier)
+        .collect();
+    let candidates = store
+        .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(consumed_nullifiers))
+        .await?;
+    if candidates.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -79,7 +90,7 @@ pub async fn discover_pswap_rounds(
 
     let mut round_updates: Vec<PswapLineageRoundUpdate> = Vec::new();
 
-    for lineage_record in active {
+    for lineage_record in candidates {
         let mut lineage = lineage_record;
 
         // Walk forward through every round consumed this sync — the inner

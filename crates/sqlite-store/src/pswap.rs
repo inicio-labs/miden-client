@@ -63,6 +63,13 @@ impl SqliteStore {
         conn: &mut Connection,
         filter: PswapLineageFilter,
     ) -> Result<Vec<PswapLineageRecord>, StoreError> {
+        // ActiveByTipNullifiers has a dynamic IN-list — handle separately so
+        // we don't bloat the prepared-statement cache with one entry per
+        // distinct nullifier-count value.
+        if let PswapLineageFilter::ActiveByTipNullifiers(nullifiers) = &filter {
+            return list_active_by_tip_nullifiers(conn, nullifiers);
+        }
+
         // Pull every row that matches the SQL-expressible part of the
         // filter; the `ByCreator` variant is applied in Rust because the
         // creator is embedded in the serialised `original_pswap` blob.
@@ -81,6 +88,9 @@ impl SqliteStore {
             PswapLineageFilter::ByOrderId(order_id) => {
                 collect_rows(stmt.query(params![order_id.to_bytes()]).into_store_error()?)?
             },
+            PswapLineageFilter::ActiveByTipNullifiers(_) => unreachable!(
+                "ActiveByTipNullifiers is handled by the early-return above"
+            ),
         };
 
         Ok(rows)
@@ -202,7 +212,43 @@ fn sql_filter_part(filter: &PswapLineageFilter) -> &'static str {
         PswapLineageFilter::All | PswapLineageFilter::ByCreator(_) => "",
         PswapLineageFilter::Active => " WHERE state = ?",
         PswapLineageFilter::ByOrderId(_) => " WHERE order_id = ?",
+        // ActiveByTipNullifiers builds its SQL dynamically — see
+        // list_active_by_tip_nullifiers — and never routes through here.
+        PswapLineageFilter::ActiveByTipNullifiers(_) => "",
     }
+}
+
+/// Loads `Active` lineages whose `current_tip_nullifier` is in `nullifiers`.
+///
+/// Builds an `IN (?, ?, …)` clause with one placeholder per nullifier.
+/// SQLite's default parameter limit is 32 766; typical sync nullifier
+/// windows are well under that (≤ a few hundred), so we don't bother
+/// chunking. Uses `prepare` (not `prepare_cached`) because the SQL string
+/// varies with N — caching would bloat the statement cache with one entry
+/// per distinct window size.
+fn list_active_by_tip_nullifiers(
+    conn: &mut Connection,
+    nullifiers: &[Nullifier],
+) -> Result<Vec<PswapLineageRecord>, StoreError> {
+    if nullifiers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(nullifiers.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = std::format!(
+        "{SELECT_LINEAGE_COLUMNS_PREFIX} \
+         WHERE state = {state} AND current_tip_nullifier IN ({placeholders})",
+        state = PswapLineageState::Active.as_u8(),
+    );
+    let mut stmt = conn.prepare(&sql).into_store_error()?;
+    let nullifier_texts: Vec<String> =
+        nullifiers.iter().map(|n| n.as_word().to_string()).collect();
+    let rows = stmt
+        .query(rusqlite::params_from_iter(nullifier_texts.iter()))
+        .into_store_error()?;
+    collect_rows(rows)
 }
 
 fn collect_rows(mut rows: rusqlite::Rows<'_>) -> Result<Vec<PswapLineageRecord>, StoreError> {
@@ -700,6 +746,58 @@ mod tests {
 
         let listed_all = store.list_pswap_lineages(PswapLineageFilter::All).await?;
         assert_eq!(listed_all.len(), 1, "All filter returns every row");
+        Ok(())
+    }
+
+    /// `list_pswap_lineages(ActiveByTipNullifiers(...))` returns only Active
+    /// lineages whose `current_tip_nullifier` is in the given set, and is
+    /// well-behaved for empty input + non-matching input.
+    #[tokio::test]
+    async fn list_pswap_lineages_filters_by_tip_nullifiers() -> anyhow::Result<()> {
+        let store = create_test_store().await;
+
+        // Insert one Active lineage; capture its tip nullifier.
+        let rec = build_initial_record(build_test_pswap(100, 50));
+        let real_tip = rec.current_tip_nullifier;
+        store.upsert_pswap_lineage(&rec).await?;
+
+        // Build a second PSWAP we DON'T insert — its tip serves as a
+        // realistic "not in store" sentinel (the test stays oblivious to
+        // Nullifier's construction internals).
+        let phantom_tip =
+            build_initial_record(build_test_pswap(999, 999)).current_tip_nullifier;
+
+        // Empty input: no rows.
+        let empty = store
+            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(Vec::new()))
+            .await?;
+        assert!(empty.is_empty(), "empty nullifier set should return no rows");
+
+        // Non-matching nullifier: no rows.
+        let none = store
+            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(vec![phantom_tip]))
+            .await?;
+        assert!(none.is_empty(), "non-matching nullifier should return no rows");
+
+        // Matching nullifier: returns the row.
+        let one = store
+            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(vec![real_tip]))
+            .await?;
+        assert_eq!(one.len(), 1, "matching nullifier should return its lineage");
+        assert_eq!(one[0].current_tip_nullifier, real_tip);
+
+        // Mixed set (real + phantom): returns just the real one. Exercises
+        // the multi-element IN-clause path.
+        let mixed = store
+            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(vec![
+                phantom_tip,
+                real_tip,
+                phantom_tip,
+            ]))
+            .await?;
+        assert_eq!(mixed.len(), 1, "mixed set should return only the matching lineage");
+        assert_eq!(mixed[0].current_tip_nullifier, real_tip);
+
         Ok(())
     }
 }

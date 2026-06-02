@@ -268,6 +268,12 @@ pub enum PswapLineageFilter {
     ByCreator(AccountId),
     /// Return at most one row whose `order_id` matches.
     ByOrderId(Felt),
+    /// Return Active rows whose `current_tip_nullifier` is in the given set.
+    /// Empty input returns no rows. Used by the sync correlator to load only
+    /// the lineages whose tip was consumed in this sync window — avoids the
+    /// "load every active lineage" scan when activity is sparse. See
+    /// [`crate::pswap::discovery::discover_pswap_rounds`].
+    ActiveByTipNullifiers(alloc::vec::Vec<Nullifier>),
 }
 
 // SERDE HELPERS

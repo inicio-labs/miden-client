@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use miden_protocol::Felt;
 use miden_protocol::asset::AssetAmount;
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{Note, NoteId, Nullifier};
+use miden_protocol::note::{Note, Nullifier};
 use miden_standards::note::{PswapNote, PswapNoteAttachment};
 use tracing::error;
 
@@ -36,26 +36,12 @@ use crate::sync::StateSyncUpdate;
 // PUBLIC ENTRY POINT
 // -----------------------------------------------------------------------------
 
-/// Joins the post-sync state update with the per-sync PSWAP chain-note
-/// collector and returns one [`PswapLineageRoundUpdate`] per advanced
-/// round, in the order rounds should be applied.
-///
-/// Walks each active lineage; for each whose `current_tip_nullifier`
-/// appears in the sync's nullifier window, looks up the round's
-/// `(payback, remainder)` candidate set in `chain_note_updates`
-/// (indexed by `(order_id, depth)`), classifies them via reconstruction
-/// against `PswapNote::payback_note` / `remainder_note`, and builds a
-/// round update. Loops on the new tip to catch same-block multi-fill.
-///
-/// The store applies each returned round update inside its own SQL
-/// transaction via [`crate::store::Store::apply_pswap_round`]. The depth
-/// invariant is checked inside `apply_pswap_round` as the last line of
-/// defense; this function maintains it preemptively by advancing
-/// in-memory.
-///
-/// Empty `chain_note_updates` AND empty `current_window_nullifier_blocks`
-/// is the steady-state happy path (no PSWAP activity this sync) and
-/// returns `Ok(vec![])` after a single store query.
+/// Returns one [`PswapLineageRoundUpdate`] per round advanced this sync,
+/// in apply order. For each active lineage whose tip nullifier appears in
+/// the sync's consumed-nullifier window, looks up the round's notes by
+/// `(order_id, depth)`, classifies payback vs remainder by tag, and
+/// builds the round update. Loops on the new tip to catch same-block
+/// multi-fill. Returns empty when the sync had no PSWAP activity.
 pub async fn discover_pswap_rounds(
     store: Arc<dyn Store>,
     state_sync_update: &StateSyncUpdate,
@@ -73,22 +59,19 @@ pub async fn discover_pswap_rounds(
         return Ok(Vec::new());
     }
 
-    // Group chain note updates by (order_id, depth) for O(1) per-round
-    // lookups inside the per-lineage walk below.
-    let mut updates_by_order_depth: BTreeMap<(OrderIdKey, u64), Vec<&PswapChainNoteUpdate>> =
+    // Group observed notes by (order_id, depth) for O(1) per-round lookup.
+    let mut notes_by_order_depth: BTreeMap<(OrderIdKey, u32), Vec<&PswapChainNoteUpdate>> =
         BTreeMap::new();
-    for u in chain_note_updates {
-        updates_by_order_depth
-            .entry((OrderIdKey::from(u.order_id), u.depth))
+    for note in chain_note_updates {
+        notes_by_order_depth
+            .entry((OrderIdKey::from(note.order_id), note.depth))
             .or_default()
-            .push(u);
+            .push(note);
     }
 
-    // Index the nullifier window for fast lookup by nullifier. The same
-    // nullifier appearing twice is a protocol-invariant violation that
-    // we collapse to the first observation; the correlator is per-round
-    // and won't re-process anyway.
-    let nullifier_blocks: BTreeMap<Nullifier, BlockNumber> = state_sync_update
+    // Index the consumed-nullifier window for fast tip-lookup. Duplicate
+    // nullifiers collapse to first observation (correlator is per-round).
+    let nullifier_to_block: BTreeMap<Nullifier, BlockNumber> = state_sync_update
         .current_window_nullifier_blocks
         .iter()
         .copied()
@@ -96,28 +79,25 @@ pub async fn discover_pswap_rounds(
 
     let mut round_updates: Vec<PswapLineageRoundUpdate> = Vec::new();
 
-    for lineage in active {
-        let mut current = lineage;
+    for lineage_record in active {
+        let mut lineage = lineage_record;
 
-        // Walk forward through every round consumed in this sync. The
-        // inner loop catches same-block multi-fill — after applying
-        // round N in-memory, the new tip's nullifier may itself appear
-        // in the window (for batched fills landing in the same block),
-        // and we want to advance the lineage through every round
-        // observable from this single sync.
-        while let Some(&block) = nullifier_blocks.get(&current.current_tip_nullifier) {
-            let round_depth = current.current_depth + 1;
-            let matches = updates_by_order_depth
-                .get(&(OrderIdKey::from(current.order_id()), round_depth))
+        // Walk forward through every round consumed this sync — the inner
+        // loop catches same-block multi-fill (batched fills landing in
+        // one block) by re-checking the new tip's nullifier.
+        while let Some(&at_block_num) = nullifier_to_block.get(&lineage.current_tip_nullifier) {
+            let round_depth = lineage.current_depth + 1;
+            let notes = notes_by_order_depth
+                .get(&(OrderIdKey::from(lineage.order_id()), round_depth))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
 
-            let update = match build_round_update(&current, round_depth, block, matches) {
+            let update = match build_round_update(&lineage, round_depth, at_block_num, notes) {
                 Ok(Some(u)) => u,
-                Ok(None) => break, // unresolvable: log inside; leave the lineage at the old tip
+                Ok(None) => break,
                 Err(err) => {
                     error!(
-                        order_id = ?current.order_id(),
+                        order_id = ?lineage.order_id(),
                         round_depth,
                         error = ?err,
                         "discover_pswap_rounds: round build failed; skipping lineage",
@@ -126,7 +106,7 @@ pub async fn discover_pswap_rounds(
                 },
             };
 
-            current = current.apply_round_in_memory(&update);
+            lineage = lineage.apply_round_in_memory(&update);
             round_updates.push(update);
         }
     }
@@ -138,48 +118,32 @@ pub async fn discover_pswap_rounds(
 // PER-ROUND CLASSIFICATION
 // -----------------------------------------------------------------------------
 
-/// Builds a [`PswapLineageRoundUpdate`] for one round advance of `current`.
-///
-/// Returns `Ok(None)` for unresolvable but non-corrupting situations
-/// (e.g. consumer-not-creator with zero outputs); the caller logs and
-/// leaves the lineage at its previous tip. Returns `Err(_)` only for
-/// reconstruction or commitment-parity failures, which are fail-loud
-/// per the [`PswapLineageError::CommitmentMismatch`] contract.
+/// Builds a [`PswapLineageRoundUpdate`] for one round advance of `lineage`.
+/// `Err(_)` on reconstruction or commitment-parity failures (fail-loud).
 fn build_round_update(
-    current: &PswapLineageRecord,
-    round_depth: u64,
-    block: BlockNumber,
-    matches: &[&PswapChainNoteUpdate],
+    lineage: &PswapLineageRecord,
+    round_depth: u32,
+    at_block_num: BlockNumber,
+    notes: &[&PswapChainNoteUpdate],
 ) -> Result<Option<PswapLineageRoundUpdate>, ClientError> {
-    let original = &current.original_pswap;
+    let original = &lineage.original_pswap;
 
-    match matches.len() {
+    match notes.len() {
         0 => {
-            // No outputs in the block where the tip was consumed. The
-            // PSWAP script only emits the cancel branch (no outputs)
-            // when the consumer is the creator, so by protocol
-            // invariant this *must* be a reclaim — but the
-            // `current_window_nullifier_blocks` signal alone does not
-            // tell us who the consumer was. Treat any 0-output
-            // consumption of an Active tip as a reclaim and let the
-            // store-side depth invariant catch any divergence at
-            // apply time.
+            // Reclaim: only the creator can consume via the cancel branch,
+            // which emits no outputs.
             Ok(Some(PswapLineageRoundUpdate {
-                order_id: current.order_id(),
+                order_id: lineage.order_id(),
                 round_depth,
-                consumer_account_id: current.creator_account_id(),
+                consumer_account_id: lineage.creator_account_id(),
                 fill_amount: AssetAmount::ZERO,
-                payout_amount: current.remaining_offered,
+                payout_amount: lineage.remaining_offered,
                 remaining_offered: AssetAmount::ZERO,
-                // Terminal state: per the field doc on
-                // `PswapLineageRoundUpdate::remaining_requested`, both
-                // remaining_* columns settle to 0 on a reclaim (no further
-                // rounds can fill the requested side).
                 remaining_requested: AssetAmount::ZERO,
                 state: PswapLineageState::Reclaimed,
                 tip_note_id: None,
                 tip_nullifier: None,
-                at_block: block,
+                at_block: at_block_num,
                 payback: None,
                 payback_inclusion_proof: None,
                 remainder: None,
@@ -187,102 +151,69 @@ fn build_round_update(
             }))
         },
         1 => {
-            // Full fill — exactly the payback was emitted. Reconstruct
-            // it; if the reconstructed id matches the observed id, the
-            // round is well-formed.
-            let candidate = matches[0];
-            let payback = reconstruct_payback(original, candidate, round_depth)?;
+            // Full fill — only a payback was emitted.
+            let payback_note_update = notes[0];
+            let payback = reconstruct_payback(original, payback_note_update, round_depth)?;
 
-            // Saturating subtraction (preserves the v1 semantics of "round
-            // off any over-fill rather than refuse to apply"). Convert
-            // u64 → AssetAmount at the boundary; the result is always
-            // <= MAX because we started from a validated AssetAmount.
-            let remaining_requested = AssetAmount::new(
-                u64::from(current.remaining_requested).saturating_sub(candidate.amount),
-            )
-            .expect("saturating_sub of validated AssetAmount stays within MAX");
-            let fill_amount =
-                AssetAmount::new(candidate.amount).map_err(crate::ClientError::AssetError)?;
+            // Saturating sub preserves v1 "round off over-fill" semantics.
+            let remaining_requested = (lineage.remaining_requested - payback_note_update.amount)
+                .unwrap_or(AssetAmount::ZERO);
 
             Ok(Some(PswapLineageRoundUpdate {
-                order_id: current.order_id(),
+                order_id: lineage.order_id(),
                 round_depth,
-                consumer_account_id: candidate.sender,
-                fill_amount,
-                payout_amount: current.remaining_offered,
+                consumer_account_id: payback_note_update.sender,
+                fill_amount: payback_note_update.amount,
+                payout_amount: lineage.remaining_offered,
                 remaining_offered: AssetAmount::ZERO,
                 remaining_requested,
                 state: PswapLineageState::FullyFilled,
                 tip_note_id: None,
                 tip_nullifier: None,
-                at_block: block,
+                at_block: at_block_num,
                 payback: Some(payback),
-                payback_inclusion_proof: Some(candidate.inclusion_proof.clone()),
+                payback_inclusion_proof: Some(payback_note_update.inclusion_proof.clone()),
                 remainder: None,
                 remainder_inclusion_proof: None,
             }))
         },
         2 => {
-            // Partial fill — payback + remainder. Try each candidate as
-            // the payback; the one whose reconstruction matches is the
-            // payback, and the other is the remainder.
-            let (payback_idx, payback_note) =
-                find_payback_index(original, matches, round_depth)?;
-            let payback_cand = matches[payback_idx];
-            let remainder_cand = matches[1 - payback_idx];
+            // Partial fill — payback + remainder. Distinguish by tag: the
+            // payback's tag is the creator-derived P2ID tag, the remainder's
+            // is the PSWAP asset-pair tag.
+            let payback_tag = original.storage().payback_note_tag();
+            let (payback_note_update, remainder_note_update) = if notes[0].tag == payback_tag {
+                (notes[0], notes[1])
+            } else {
+                (notes[1], notes[0])
+            };
 
-            // Consumer must match across both candidates.
-            if payback_cand.sender != remainder_cand.sender {
-                return Err(PswapLineageError::InconsistentRow(format!(
-                    "payback sender {} != remainder sender {} for order_id {}",
-                    payback_cand.sender, remainder_cand.sender, current.order_id(),
-                ))
-                .into());
-            }
+            let payback_note =
+                reconstruct_payback(original, payback_note_update, round_depth)?;
 
-            // Saturating subtraction: preserves v1 "round off any
-            // over-fill rather than refuse to apply" semantics. Inputs
-            // are already-validated AssetAmounts so the result is always
-            // <= MAX (`expect` justified).
-            let remaining_requested = AssetAmount::new(
-                u64::from(current.remaining_requested).saturating_sub(payback_cand.amount),
-            )
-            .expect("saturating_sub of validated AssetAmount stays within MAX");
-            let remaining_offered = AssetAmount::new(
-                u64::from(current.remaining_offered).saturating_sub(remainder_cand.amount),
-            )
-            .expect("saturating_sub of validated AssetAmount stays within MAX");
-
-            // Boundary conversion: candidate.amount is u64 (raw word
-            // from the observer) → AssetAmount for the typed builder.
-            let payout_amount =
-                AssetAmount::new(remainder_cand.amount).map_err(crate::ClientError::AssetError)?;
-            let fill_amount =
-                AssetAmount::new(payback_cand.amount).map_err(crate::ClientError::AssetError)?;
+            let remaining_requested = (lineage.remaining_requested - payback_note_update.amount)
+                .unwrap_or(AssetAmount::ZERO);
+            let remaining_offered = (lineage.remaining_offered - remainder_note_update.amount)
+                .unwrap_or(AssetAmount::ZERO);
 
             let attachment = PswapNoteAttachment::new(
-                payout_amount,
-                current.order_id(),
-                u32::try_from(round_depth)
-                    .map_err(|_| PswapLineageError::Reconstruction(
-                        miden_protocol::errors::NoteError::other(
-                            "round_depth does not fit in u32",
-                        ),
-                    ))?,
+                remainder_note_update.amount,
+                lineage.order_id(),
+                round_depth,
             );
             let remainder_note = original
                 .remainder_note(
-                    remainder_cand.sender,
+                    remainder_note_update.sender,
                     &attachment,
                     remaining_offered,
                     remaining_requested,
                 )
                 .map_err(PswapLineageError::Reconstruction)?;
 
-            if remainder_note.id() != remainder_cand.note_id {
+            if remainder_note.id() != remainder_note_update.note_id {
                 return Err(PswapLineageError::CommitmentMismatch {
                     reconstructed: format!("{}", remainder_note.id().as_word()),
-                    observed: format!("{}", remainder_cand.note_id.as_word()),
+                    observed: format!("{}", remainder_note_update.note_id.as_word()),
                 }
                 .into());
             }
@@ -290,96 +221,43 @@ fn build_round_update(
             let tip_nullifier = remainder_note.nullifier();
 
             Ok(Some(PswapLineageRoundUpdate {
-                order_id: current.order_id(),
+                order_id: lineage.order_id(),
                 round_depth,
-                consumer_account_id: payback_cand.sender,
-                fill_amount,
-                payout_amount,
+                consumer_account_id: payback_note_update.sender,
+                fill_amount: payback_note_update.amount,
+                payout_amount: remainder_note_update.amount,
                 remaining_offered,
                 remaining_requested,
                 state: PswapLineageState::Active,
-                tip_note_id: Some(remainder_cand.note_id),
+                tip_note_id: Some(remainder_note_update.note_id),
                 tip_nullifier: Some(tip_nullifier),
-                at_block: block,
+                at_block: at_block_num,
                 payback: Some(payback_note),
-                payback_inclusion_proof: Some(payback_cand.inclusion_proof.clone()),
+                payback_inclusion_proof: Some(payback_note_update.inclusion_proof.clone()),
                 remainder: Some(remainder_note),
-                remainder_inclusion_proof: Some(remainder_cand.inclusion_proof.clone()),
+                remainder_inclusion_proof: Some(remainder_note_update.inclusion_proof.clone()),
             }))
         },
-        n => {
-            // > 2 candidates for one (order_id, depth) is a
-            // protocol-invariant violation. Skip the round; the
-            // operator can inspect the logs.
-            error!(
-                order_id = ?current.order_id(),
-                round_depth,
-                candidate_count = n,
-                "discover_pswap_rounds: unexpected (order_id, depth) candidate count; skipping",
-            );
-            Ok(None)
-        },
+        // Protocol invariant: a PSWAP round emits 0, 1, or 2 notes.
+        _ => unreachable!("PSWAP emits at most 2 notes per (order_id, depth)"),
     }
 }
 
-/// Tries each candidate as the payback. Returns the matching index and
-/// the reconstructed payback note. Errors when no candidate reconstructs
-/// to its observed `note_id` — this is the fail-loud
-/// commitment-mismatch contract.
-fn find_payback_index(
-    original: &PswapNote,
-    matches: &[&PswapChainNoteUpdate],
-    round_depth: u64,
-) -> Result<(usize, Note), ClientError> {
-    let mut reconstructed_ids: Vec<NoteId> = Vec::with_capacity(matches.len());
-    for (i, cand) in matches.iter().enumerate() {
-        let attachment = PswapNoteAttachment::new(
-            AssetAmount::new(cand.amount).map_err(crate::ClientError::AssetError)?,
-            cand.order_id,
-            u32::try_from(round_depth).map_err(|_| {
-                PswapLineageError::Reconstruction(miden_protocol::errors::NoteError::other(
-                    "round_depth does not fit in u32",
-                ))
-            })?,
-        );
-        let reconstructed = original
-            .payback_note(cand.sender, &attachment)
-            .map_err(PswapLineageError::Reconstruction)?;
-        if reconstructed.id() == cand.note_id {
-            return Ok((i, reconstructed));
-        }
-        reconstructed_ids.push(reconstructed.id());
-    }
-
-    // None matched — surface the first observed id and the
-    // corresponding reconstructed id so the operator has both halves of
-    // the mismatch.
-    let observed = format!("{}", matches[0].note_id.as_word());
-    let reconstructed = format!("{}", reconstructed_ids[0].as_word());
-    Err(PswapLineageError::CommitmentMismatch { reconstructed, observed }.into())
-}
-
+/// Reconstructs the payback note from its observed metadata and verifies
+/// the id matches (fail-loud commitment-mismatch contract).
 fn reconstruct_payback(
     original: &PswapNote,
-    candidate: &PswapChainNoteUpdate,
-    round_depth: u64,
+    note_update: &PswapChainNoteUpdate,
+    round_depth: u32,
 ) -> Result<Note, ClientError> {
-    let attachment = PswapNoteAttachment::new(
-        AssetAmount::new(candidate.amount).map_err(ClientError::AssetError)?,
-        candidate.order_id,
-        u32::try_from(round_depth).map_err(|_| {
-            PswapLineageError::Reconstruction(miden_protocol::errors::NoteError::other(
-                "round_depth does not fit in u32",
-            ))
-        })?,
-    );
+    let attachment = PswapNoteAttachment::new(note_update.amount, note_update.order_id, round_depth);
     let reconstructed = original
-        .payback_note(candidate.sender, &attachment)
+        .payback_note(note_update.sender, &attachment)
         .map_err(PswapLineageError::Reconstruction)?;
-    if reconstructed.id() != candidate.note_id {
+    if reconstructed.id() != note_update.note_id {
         return Err(PswapLineageError::CommitmentMismatch {
             reconstructed: format!("{}", reconstructed.id().as_word()),
-            observed: format!("{}", candidate.note_id.as_word()),
+            observed: format!("{}", note_update.note_id.as_word()),
         }
         .into());
     }
@@ -478,11 +356,11 @@ mod tests {
     /// the canonical `order_id` from the PSWAP under test. Centralises
     /// the `u64 -> AssetAmount` + `u64 -> u32` conversions so call sites
     /// stay terse:  `pswap_attachment(&pswap, depth, amount)`.
-    fn pswap_attachment(pswap: &PswapNote, depth: u64, amount: u64) -> PswapNoteAttachment {
+    fn pswap_attachment(pswap: &PswapNote, depth: u32, amount: u64) -> PswapNoteAttachment {
         PswapNoteAttachment::new(
             AssetAmount::new(amount).expect("amount fits in AssetAmount"),
             pswap.order_id(),
-            u32::try_from(depth).expect("depth fits in u32"),
+            depth,
         )
     }
     fn asset_amount(v: u64) -> AssetAmount {
@@ -524,10 +402,12 @@ mod tests {
     /// given on-chain note. Tests build the candidate notes via the
     /// protocol's reconstruction helpers (`payback_note` / `remainder_note`),
     /// then wrap them with this so the correlator's id-match check passes.
+    /// `tag` is taken from the note's metadata so the correlator's tag-based
+    /// payback/remainder differentiation matches reality.
     fn chain_update_from(
         note: &Note,
         order_id: Felt,
-        depth: u64,
+        depth: u32,
         amount: u64,
         sender: AccountId,
         block: u32,
@@ -536,9 +416,10 @@ mod tests {
             note_id: note.id(),
             order_id,
             depth,
-            amount,
+            amount: AssetAmount::new(amount).expect("test amount fits in AssetAmount"),
             sender,
-            block: BlockNumber::from(block),
+            tag: note.metadata().tag(),
+            block_num: BlockNumber::from(block),
             inclusion_proof: dummy_inclusion_proof(block),
         }
     }
@@ -673,40 +554,6 @@ mod tests {
         assert_eq!(update.remaining_requested, AssetAmount::ZERO);
         assert!(update.payback.is_none());
         assert!(update.payback_inclusion_proof.is_none());
-    }
-
-    /// `> 2` candidates for one round is a protocol-invariant violation;
-    /// the correlator returns `Ok(None)` and lets the operator inspect
-    /// the logs rather than corrupting the lineage.
-    #[test]
-    fn build_round_update_more_than_two_candidates_returns_none() {
-        let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let consumer = AccountId::try_from(
-            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-        )
-        .unwrap();
-        let creator = AccountId::try_from(
-            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
-        )
-        .unwrap();
-
-        let pswap = build_test_pswap(consumer, creator, offered_faucet, 100, requested_faucet, 50);
-        let record = initial_record(pswap.clone(), 100, 50);
-
-        // Three reconstructed-payback candidates at different fill
-        // amounts. The exact bodies don't matter — `build_round_update`
-        // takes the count-based fast path before reconstruction.
-        let p1 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, 10)).unwrap();
-        let p2 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, 20)).unwrap();
-        let p3 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, 30)).unwrap();
-        let order_id = pswap.order_id();
-        let c1 = chain_update_from(&p1, order_id, 1, 10, consumer, 3);
-        let c2 = chain_update_from(&p2, order_id, 1, 20, consumer, 3);
-        let c3 = chain_update_from(&p3, order_id, 1, 30, consumer, 3);
-
-        let result = build_round_update(&record, 1, BlockNumber::from(3), &[&c1, &c2, &c3])
-            .expect("> 2 candidates is a soft-skip, not an error");
-        assert!(result.is_none(), "expected Ok(None); got {result:?}");
     }
 
     /// Same-block multi-fill: round 1 advances the lineage in memory;

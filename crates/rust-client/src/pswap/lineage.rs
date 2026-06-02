@@ -86,8 +86,9 @@ pub struct PswapLineageRecord {
     /// observer can match incoming consumed-nullifier events against active
     /// lineages with a single query.
     pub current_tip_nullifier: Nullifier,
-    /// 0 for the original tip; increments by 1 each round.
-    pub current_depth: u64,
+    /// 0 for the original tip; increments by 1 each round. Matches the
+    /// protocol's `PswapNoteAttachment::depth()` (u32).
+    pub current_depth: u32,
     /// Offered-asset units still unfilled at this point in the chain. Starts
     /// at `original_pswap.offered_asset().amount()` and decreases by the
     /// per-round `payout_amount` until reaching zero. Typed as
@@ -205,7 +206,7 @@ pub struct PswapLineageRoundUpdate {
     pub order_id: Felt,
     /// `previous_depth + 1`. The protocol's PSWAP script stamps this in the
     /// attachment word of every output note emitted in this round.
-    pub round_depth: u64,
+    pub round_depth: u32,
     /// Account that consumed the previous tip and emitted the new outputs.
     /// For a reclaim, equals the creator.
     pub consumer_account_id: AccountId,
@@ -282,7 +283,7 @@ pub fn build_record_from_columns(
     original_pswap: PswapNote,
     current_tip_note_id: NoteId,
     current_tip_nullifier: Nullifier,
-    current_depth: u64,
+    current_depth: u32,
     remaining_offered: u64,
     remaining_requested: u64,
     last_consumer_account_id: Option<AccountId>,

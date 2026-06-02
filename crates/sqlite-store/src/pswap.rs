@@ -217,7 +217,7 @@ fn record_from_row(row: &Row<'_>) -> Result<PswapLineageRecord, StoreError> {
     let original_pswap_bytes: Vec<u8> = row.get(1).into_store_error()?;
     let current_tip_text: String = row.get(2).into_store_error()?;
     let nullifier_text: String = row.get(3).into_store_error()?;
-    let current_depth: u64 = row.get(4).into_store_error()?;
+    let current_depth: u32 = row.get(4).into_store_error()?;
     let remaining_offered: u64 = row.get(5).into_store_error()?;
     let remaining_requested: u64 = row.get(6).into_store_error()?;
     let last_consumer_bytes: Option<Vec<u8>> = row.get(7).into_store_error()?;
@@ -318,7 +318,7 @@ fn update_lineage_tip_tx(
     //      `PswapNote::payback_note` / `remainder_note` call depends on
     //      `current_depth + 1` being the round that produced the tip).
     const DEPTH_SQL: &str = "SELECT current_depth FROM pswap_lineages WHERE order_id = ?";
-    let current_depth: Option<u64> = tx
+    let current_depth: Option<u32> = tx
         .prepare_cached(DEPTH_SQL)
         .into_store_error()?
         .query_row(params![order_id_bytes], |row| row.get(0))

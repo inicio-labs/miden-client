@@ -10,8 +10,9 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use miden_protocol::Felt;
 use miden_protocol::account::AccountId;
+use miden_protocol::asset::AssetAmount;
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{NoteId, NoteInclusionProof};
+use miden_protocol::note::{NoteId, NoteInclusionProof, NoteTag};
 use miden_standards::note::PswapNote;
 
 use crate::ClientError;
@@ -24,44 +25,36 @@ use crate::utils::RwLock;
 // PSWAP CHAIN NOTE UPDATE
 // ================================================================================================
 
-/// Sync-time observation of a note that may belong to a tracked PSWAP chain.
+/// Sync-time observation of a note carrying a PSWAP attachment, scoped to
+/// an active lineage on this client.
 ///
-/// The observer pushes one of these per incoming `CommittedNote` whose
-/// metadata carries a PSWAP attachment AND whose `order_id` matches an
-/// active lineage in our store. By the time the post-sync correlator runs,
-/// the collector contains only updates relevant to *our* lineages — at
-/// most `2 * active_lineages` per round (one payback + one remainder
-/// per chain) regardless of how many other PSWAP orders flew by on the
-/// network.
-///
-/// Naming follows the codebase convention for sync-time observations
-/// (`NoteUpdateTracker`, `NoteUpdateType`, `NoteUpdateAction`).
+/// The observer pushes one per incoming PSWAP-attachment note whose
+/// `order_id` matches an active lineage. The collector ends up holding
+/// at most `2 * active_lineages` updates per sync (payback + remainder
+/// per chain) regardless of unrelated PSWAP traffic on the network.
 #[derive(Debug, Clone)]
 pub struct PswapChainNoteUpdate {
-    /// Note ID as observed in the sync response.
     pub note_id: NoteId,
-    /// `attachment_word[1]` — stable across the whole chain. Matches
+    /// `attachment_word[1]` — stable across the chain, matches
     /// `PswapLineageRecord::order_id()`.
     pub order_id: Felt,
-    /// `attachment_word[2]` — the round counter stamped by the PSWAP
-    /// script on every output note it emits.
-    pub depth: u64,
+    /// `attachment_word[2]` — round counter stamped by the PSWAP script.
+    pub depth: u32,
     /// `attachment_word[0]` — `fill_amount` on a payback, `payout_amount`
-    /// on a remainder. The correlator decides which role this note is
-    /// playing via reconstruction (see `classify_by_reconstruction`).
-    pub amount: u64,
-    /// `metadata.sender()` — the account that consumed the previous tip
-    /// and emitted this note as part of the fill (or reclaim) transaction.
+    /// on a remainder. Role is distinguished by [`Self::tag`].
+    pub amount: AssetAmount,
+    /// `metadata.sender()` — the account that consumed the previous tip.
     pub sender: AccountId,
-    /// Block number the note was committed in.
-    pub block: BlockNumber,
-    /// Inclusion proof for the note in the block. Captured here so the
-    /// post-sync correlator can hand it to the store when inserting
-    /// the reconstructed payback into `input_notes` — without it, the
-    /// payback would land in `Expected` state with no way to advance
-    /// to `Committed` (the default `NoteScreener` Discards private
-    /// notes it does not already track, so the inclusion proof would
-    /// never reach the screener's state-promotion path).
+    /// `metadata.tag()` — distinguishes payback (P2ID-style tag) from
+    /// remainder (asset-pair Subscription tag) without reconstruction
+    /// guesswork. Verified against the lineage's asset-pair tag in the
+    /// correlator.
+    pub tag: NoteTag,
+    /// Block in which the note was committed.
+    pub block_num: BlockNumber,
+    /// Inclusion proof, captured here so `apply_pswap_round` can insert
+    /// the reconstructed note in `Unverified` state (carries the proof,
+    /// promoted to `Committed` by the next sync's state-promotion path).
     pub inclusion_proof: NoteInclusionProof,
 }
 
@@ -139,9 +132,8 @@ impl NoteObserver for PswapChainObserver {
             return Ok(());
         }
 
-        // 4. Record. The correlator drains this after
-        //    `StateSync::sync_state` returns and decides per-note role
-        //    (payback vs remainder) via reconstruction.
+        // 4. Record. The correlator drains this after `StateSync::sync_state`
+        //    returns. The `tag` is enough to distinguish payback vs remainder.
         let inclusion_proof = committed_note.inclusion_proof().clone();
         let update = PswapChainNoteUpdate {
             note_id: *committed_note.note_id(),
@@ -149,7 +141,8 @@ impl NoteObserver for PswapChainObserver {
             depth,
             amount,
             sender: committed_note.sender(),
-            block: inclusion_proof.location().block_num(),
+            tag: committed_note.metadata().tag(),
+            block_num: inclusion_proof.location().block_num(),
             inclusion_proof,
         };
 
@@ -171,7 +164,7 @@ impl NoteObserver for PswapChainObserver {
 /// - the attachment exists but has no content words (which would be a
 ///   protocol-invariant violation — treated as "skip" rather than error
 ///   since the observer is fail-open).
-fn pswap_attachment_fields(committed_note: &CommittedNote) -> Option<(Felt, u64, u64)> {
+fn pswap_attachment_fields(committed_note: &CommittedNote) -> Option<(Felt, u32, AssetAmount)> {
     // TEMP-PROTOCOL-ADAPTER: returns `None` for every PSWAP note. The
     // wire format already carries attachment content for private notes,
     // but the in-tree `CommittedNote` doesn't expose it — so we can

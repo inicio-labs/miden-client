@@ -265,11 +265,7 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             let attachment = miden_standards::note::PswapNoteAttachment::new(
                 last_payout,
                 lineage.order_id(),
-                u32::try_from(lineage.current_depth).map_err(|_| {
-                    PswapLineageError::InconsistentRow(alloc::string::String::from(
-                        "current_depth does not fit in u32",
-                    ))
-                })?,
+                lineage.current_depth,
             );
             lineage
                 .original_pswap

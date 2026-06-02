@@ -41,8 +41,11 @@
 //! - [`discovery`] — the post-sync correlator that builds round updates.
 //! - [`errors`] — error types specific to PSWAP chain tracking.
 //!
-//! See `/Users/vaibhavjindal/.claude/plans/plan-with-me-and-cheeky-corbato.md`
-//! for the full design rationale and protocol-side contract.
+//! The protocol-side `PswapNote` invariants this subsystem relies on
+//! (one payback + at most one remainder per round; attachment word
+//! layout `[amount, order_id, depth, 0]`; deterministic remainder
+//! reconstruction from `(consumer, attachment, remaining_*)`) are
+//! documented in `miden_standards::note::PswapNote`.
 
 pub mod discovery;
 pub mod errors;
@@ -264,9 +267,12 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             // The current tip is a remainder this client never
             // originated. Reconstruct it byte-identically from the
             // stored `last_consumer` / `last_payout` / `remaining_*`.
-            // The senior-engineer review of commit c86bcd8b validated
-            // these fields' consistency at deserialization time, so
-            // the unwraps below are infallible by invariant.
+            // `lineage::build_record_from_columns` validates these
+            // fields' consistency at deserialization time
+            // (last_consumer + last_payout must both be present iff
+            // current_depth > 0), so the unwraps below are infallible
+            // by row invariant — but we propagate
+            // `InconsistentRow` defensively.
             let last_consumer = lineage.last_consumer_account_id.ok_or(
                 PswapLineageError::InconsistentRow(alloc::string::String::from(
                     "current_depth > 0 but last_consumer_account_id is NULL",

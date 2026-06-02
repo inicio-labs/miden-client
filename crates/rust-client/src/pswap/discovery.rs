@@ -483,7 +483,8 @@ mod tests {
 
     /// Builds a typed `PswapNoteAttachment` from raw test inputs, using
     /// the canonical `order_id` from the PSWAP under test. Centralises
-    /// the conversion so each test reads as `(amount, depth)`.
+    /// the `u64 -> AssetAmount` + `u64 -> u32` conversions so call sites
+    /// stay terse:  `pswap_attachment(&pswap, depth, amount)`.
     fn pswap_attachment(pswap: &PswapNote, depth: u64, amount: u64) -> PswapNoteAttachment {
         PswapNoteAttachment::new(
             AssetAmount::new(amount).expect("amount fits in AssetAmount"),

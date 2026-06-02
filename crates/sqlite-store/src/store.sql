@@ -274,24 +274,34 @@ CREATE INDEX idx_addresses_account_id ON addresses(account_id);
 -- when the creator wants to reclaim a chain that has been partially
 -- filled by other accounts (the creator never originated the remainder,
 -- so we need enough information to rebuild it byte-identically).
+-- Storage-format note: this table mixes BLOB (for Felt-/AccountId-shaped
+-- keys: `order_id`, `last_consumer_account_id`, `original_pswap`) and TEXT
+-- (for hash-shaped keys: `current_tip_note_id`, `current_tip_nullifier`).
+-- The TEXT-vs-BLOB choice on a per-column basis matches how the same
+-- types are persisted in sibling tables (`input_notes`/`output_notes`
+-- use TEXT for note_id and nullifier; account-related tables generally
+-- use TEXT for account_id). For consistency with the wider codebase, a
+-- future migration should convert `order_id` and `last_consumer_account_id`
+-- to TEXT — see review note n5; deferred to the same migration that
+-- moves this table out of `store.sql` into its own migration script.
 CREATE TABLE pswap_lineages (
     order_id                  BLOB    NOT NULL,  -- Felt (8 bytes), == original_pswap.serial[1]
     original_pswap            BLOB    NOT NULL,  -- serialised PswapNote (source of truth for every initial-* field)
 
     -- Live tip state.
-    current_tip_note_id       TEXT    NOT NULL,
-    current_tip_nullifier     TEXT    NOT NULL,  -- hex; indexed for fast lookup during sync
-    current_depth             UNSIGNED BIG INT NOT NULL,  -- u64, 0 for the original tip
-    remaining_offered         UNSIGNED BIG INT NOT NULL,  -- u64
-    remaining_requested       UNSIGNED BIG INT NOT NULL,  -- u64
+    current_tip_note_id       TEXT    NOT NULL,                  -- hex; matches sibling tables' note_id format
+    current_tip_nullifier     TEXT    NOT NULL,                  -- hex; indexed for fast lookup during sync
+    current_depth             UNSIGNED BIG INT NOT NULL,         -- u64, 0 for the original tip
+    remaining_offered         UNSIGNED BIG INT NOT NULL,         -- AssetAmount serialized as u64; validated <= AssetAmount::MAX in build_record_from_columns
+    remaining_requested       UNSIGNED BIG INT NOT NULL,         -- AssetAmount serialized as u64; validated <= AssetAmount::MAX in build_record_from_columns
 
     -- Reconstruction context for the current tip (NULL iff current_depth == 0,
     -- because the original tip is owned by the creator and stored in
     -- `output_notes` rather than reconstructed).
-    last_consumer_account_id  BLOB,                       -- AccountId (8 bytes)
-    last_payout_amount        UNSIGNED BIG INT,           -- u64 offered-asset units paid out in the most recent round
+    last_consumer_account_id  BLOB,                              -- AccountId (8 bytes); to be migrated to TEXT for codebase consistency (n5)
+    last_payout_amount        UNSIGNED BIG INT,                  -- AssetAmount serialized as u64; validated <= AssetAmount::MAX in build_record_from_columns
 
-    state                     UNSIGNED INT NOT NULL,      -- u8 PswapLineageState (Active=0, FullyFilled=1, Reclaimed=2)
+    state                     UNSIGNED INT NOT NULL,             -- PswapLineageState discriminant: Active=0, FullyFilled=1, Reclaimed=2 (see PswapLineageState::as_u8 / try_from_u8)
     created_at_block          UNSIGNED BIG INT NOT NULL,
     updated_at_block          UNSIGNED BIG INT NOT NULL,
 

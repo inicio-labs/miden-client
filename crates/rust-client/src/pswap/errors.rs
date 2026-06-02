@@ -5,6 +5,7 @@
 use alloc::string::String;
 
 use miden_protocol::Felt;
+use miden_protocol::account::AccountId;
 use miden_protocol::errors::NoteError;
 
 use super::lineage::PswapLineageState;
@@ -37,6 +38,15 @@ pub enum PswapLineageError {
     /// diagnostics.
     #[error("PSWAP lineage is not active (state = {0:?}); no further rounds expected")]
     NotActive(PswapLineageState),
+
+    /// The lineage's recorded creator is not one of this client's local
+    /// accounts. Reclaim requires the creator's signing authority, so
+    /// it cannot be issued from this wallet. Surfaced explicitly (rather
+    /// than failing later at sign time) so service-style wallets that
+    /// track PSWAPs they submitted on behalf of clients get a clear
+    /// error instead of an opaque signing failure.
+    #[error("PSWAP creator account {0} is not local; reclaim requires the creator's signing authority")]
+    CreatorNotLocal(AccountId),
 
     /// The current tip stored on the lineage row is missing from the
     /// expected store table. Implies a desync between `pswap_lineages` and

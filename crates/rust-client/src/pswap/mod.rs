@@ -83,15 +83,30 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
     ///
     /// ### Filter criteria
     ///
-    /// An output note becomes a tracked lineage iff all of:
+    /// An output note becomes a tracked lineage iff:
     ///   * `PswapNote::try_from(&note)` succeeds — the note is a PSWAP
-    ///     (this is cheap and fails fast for non-PSWAP outputs),
+    ///     (cheap, fails fast for non-PSWAP outputs), AND
     ///   * `pswap.parent_depth() == 0` — it's the originating order,
     ///     not a remainder this client happened to emit while filling
-    ///     someone else's PSWAP,
-    ///   * `pswap.storage().creator_account_id()` is in
-    ///     `store.get_account_ids()` — the creator is a local
-    ///     account; we don't track orders for foreign creators.
+    ///     someone else's PSWAP.
+    ///
+    /// **The lineage's `creator` field is NOT filtered.** Every PSWAP
+    /// this wallet submits is tracked, regardless of whether the
+    /// configured `creator_account_id` is one of our local accounts.
+    /// This supports service-style wallets that build PSWAPs on behalf
+    /// of clients — they get full chain visibility even though they
+    /// cannot themselves reclaim. The reclaim entry point
+    /// ([`Self::build_pswap_cancel_by_order`]) surfaces a clear
+    /// `CreatorNotLocal` error for these lineages.
+    ///
+    /// Trade-off: in the (rare) case of a wallet that submits PSWAPs
+    /// for non-local creators on a high-volume cadence (e.g. faucet
+    /// experimentation), this produces lineage rows that can't be
+    /// reclaimed locally. The cost is bounded (small rows + asset-pair
+    /// tag subscriptions); the alternative ("filter by local creator")
+    /// would silently lose visibility for the service case AND require
+    /// a `get_account_ids()` DB round-trip on every transaction this
+    /// client applies (most of which produce no PSWAPs at all).
     ///
     /// Multiple PSWAP creates in a single transaction (unusual but not
     /// prohibited by protocol) produce one row each.
@@ -101,20 +116,19 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
         submission_height: BlockNumber,
     ) -> Result<(), ClientError> {
         let output_notes = tx_result.executed_transaction().output_notes();
-        let tracked_account_ids: BTreeSet<_> =
-            self.store.get_account_ids().await?.into_iter().collect();
 
         for note in notes_from_output(output_notes) {
+            // Cheap PSWAP-shape filter — fails fast for non-PSWAP
+            // outputs (the dominant case for any transaction).
             let Ok(pswap) = PswapNote::try_from(note) else {
                 continue;
             };
 
+            // Skip remainders we emitted while filling someone else's
+            // PSWAP. Those belong to the OTHER chain (the one being
+            // filled), which is tracked by THAT chain's creator's
+            // wallet — not us.
             if pswap.parent_depth() != 0 {
-                continue;
-            }
-
-            let creator = pswap.storage().creator_account_id();
-            if !tracked_account_ids.contains(&creator) {
                 continue;
             }
 
@@ -248,6 +262,20 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
 
         if lineage.state != PswapLineageState::Active {
             return Err(PswapLineageError::NotActive(lineage.state).into());
+        }
+
+        // Reclaim requires the creator's signing authority. We may be
+        // tracking lineages whose creator is NOT a local account (e.g.
+        // service-style wallets that submitted a PSWAP on behalf of a
+        // remote client — see `record_created_pswap_lineages`); reclaim
+        // is unavailable for those. Failing here is loud and
+        // actionable; deferring the check would manifest as an opaque
+        // signing failure inside transaction execution.
+        let creator = lineage.creator_account_id();
+        let local_accounts: BTreeSet<_> =
+            self.store.get_account_ids().await?.into_iter().collect();
+        if !local_accounts.contains(&creator) {
+            return Err(PswapLineageError::CreatorNotLocal(creator).into());
         }
 
         let tip_note: Note = if lineage.current_depth == 0 {

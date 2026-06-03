@@ -318,8 +318,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
             record.current_tip_note_id.as_word().to_string(),
             record.current_tip_nullifier.to_hex(),
             record.current_depth,
-            u64::from(record.remaining_offered),
-            u64::from(record.remaining_requested),
+            u64::from(record.remaining_offered.amount()),
+            u64::from(record.remaining_requested.amount()),
             record.state.as_u8(),
             record.created_at_block.as_u32(),
             record.updated_at_block.as_u32(),
@@ -385,8 +385,8 @@ WHERE order_id = ?";
                     note_id.as_word().to_string(),
                     nullifier.to_hex(),
                     update.round_depth,
-                    u64::from(update.remaining_offered),
-                    u64::from(update.remaining_requested),
+                    u64::from(update.remaining_offered.amount()),
+                    u64::from(update.remaining_requested.amount()),
                     update.state.as_u8(),
                     updated_block,
                     order_id_bytes,
@@ -403,8 +403,8 @@ WHERE order_id = ?";
             tx.prepare_cached(SQL)
                 .into_store_error()?
                 .execute(params![
-                    u64::from(update.remaining_offered),
-                    u64::from(update.remaining_requested),
+                    u64::from(update.remaining_offered.amount()),
+                    u64::from(update.remaining_requested.amount()),
                     update.state.as_u8(),
                     updated_block,
                     order_id_bytes,
@@ -555,16 +555,15 @@ mod tests {
 
     fn build_initial_record(pswap: PswapNote) -> PswapLineageRecord {
         let note = Note::from(pswap.clone());
+        let remaining_offered = pswap.offered_asset().clone();
+        let remaining_requested = pswap.storage().requested_asset().clone();
         PswapLineageRecord {
-            original_pswap: pswap.clone(),
+            original_pswap: pswap,
             current_tip_note_id: note.id(),
             current_tip_nullifier: note.nullifier(),
             current_depth: 0,
-            remaining_offered: pswap.offered_asset().amount(),
-            remaining_requested: miden_protocol::asset::AssetAmount::new(
-                pswap.storage().requested_asset_amount(),
-            )
-            .expect("test PSWAP's requested_asset_amount fits in AssetAmount"),
+            remaining_offered,
+            remaining_requested,
             state: PswapLineageState::Active,
             created_at_block: BlockNumber::from(7),
             updated_at_block: BlockNumber::from(7),
@@ -622,14 +621,19 @@ mod tests {
 
         // `current_depth` is 0; only `round_depth == 1` should be accepted.
         // round_depth = 3 is a non-monotonic advance.
+        let offered_faucet = pswap.offered_asset().faucet_id();
+        let requested_faucet = pswap.storage().requested_asset().faucet_id();
+        let fa = |faucet, amount: u64| {
+            miden_protocol::asset::FungibleAsset::new(faucet, amount).unwrap()
+        };
         let bad = PswapLineageRoundUpdate {
             order_id,
             round_depth: 3,
             consumer_account_id: consumer,
-            fill_amount: miden_protocol::asset::AssetAmount::new(10).unwrap(),
-            payout_amount: miden_protocol::asset::AssetAmount::new(20).unwrap(),
-            remaining_offered: miden_protocol::asset::AssetAmount::new(80).unwrap(),
-            remaining_requested: miden_protocol::asset::AssetAmount::new(40).unwrap(),
+            fill_amount: fa(requested_faucet, 10),
+            payout_amount: fa(offered_faucet, 20),
+            remaining_offered: fa(offered_faucet, 80),
+            remaining_requested: fa(requested_faucet, 40),
             state: PswapLineageState::Active,
             tip_note_id: Some(record.current_tip_note_id),
             tip_nullifier: Some(record.current_tip_nullifier),
@@ -664,14 +668,21 @@ mod tests {
             AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
         let phantom_order_id = miden_protocol::Felt::new(0xDEAD_BEEF).unwrap();
 
+        // Use arbitrary fungible-asset faucets — the unknown-order check
+        // fires before the values are inspected.
+        let faucet =
+            AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+        let fa = |amount: u64| {
+            miden_protocol::asset::FungibleAsset::new(faucet, amount).unwrap()
+        };
         let bogus = PswapLineageRoundUpdate {
             order_id: phantom_order_id,
             round_depth: 1,
             consumer_account_id: consumer,
-            fill_amount: miden_protocol::asset::AssetAmount::new(10).unwrap(),
-            payout_amount: miden_protocol::asset::AssetAmount::new(20).unwrap(),
-            remaining_offered: miden_protocol::asset::AssetAmount::new(80).unwrap(),
-            remaining_requested: miden_protocol::asset::AssetAmount::new(40).unwrap(),
+            fill_amount: fa(10),
+            payout_amount: fa(20),
+            remaining_offered: fa(80),
+            remaining_requested: fa(40),
             state: PswapLineageState::Active,
             tip_note_id: None,
             tip_nullifier: None,
@@ -1145,8 +1156,8 @@ mod tests {
             assert_eq!(lineage.current_depth, 1, "lineage advanced to depth 1");
             assert_eq!(lineage.state, PswapLineageState::Active, "still Active after partial fill");
             assert_eq!(lineage.current_tip_note_id, remainder.id(), "tip moved to remainder");
-            assert_eq!(lineage.remaining_offered, new_offered);
-            assert_eq!(lineage.remaining_requested, new_requested);
+            assert_eq!(lineage.remaining_offered.amount(), new_offered);
+            assert_eq!(lineage.remaining_requested.amount(), new_requested);
 
             // 6. Lineage should now be visible by the new tip's nullifier
             //    (proving the remainder's nullifier is correctly tracked for
@@ -1194,8 +1205,8 @@ mod tests {
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.current_depth, 1);
             assert_eq!(lineage.state, PswapLineageState::FullyFilled);
-            assert_eq!(lineage.remaining_offered, AssetAmount::ZERO);
-            assert_eq!(lineage.remaining_requested, AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_offered.amount(), AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_requested.amount(), AssetAmount::ZERO);
             Ok(())
         }
 
@@ -1215,8 +1226,8 @@ mod tests {
 
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.state, PswapLineageState::Reclaimed);
-            assert_eq!(lineage.remaining_offered, AssetAmount::ZERO);
-            assert_eq!(lineage.remaining_requested, AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_offered.amount(), AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_requested.amount(), AssetAmount::ZERO);
             Ok(())
         }
 
@@ -1266,8 +1277,8 @@ mod tests {
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.current_depth, 2, "advanced through both rounds in one sync");
             assert_eq!(lineage.state, PswapLineageState::FullyFilled);
-            assert_eq!(lineage.remaining_offered, AssetAmount::ZERO);
-            assert_eq!(lineage.remaining_requested, AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_offered.amount(), AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_requested.amount(), AssetAmount::ZERO);
             Ok(())
         }
 
@@ -1364,8 +1375,12 @@ mod tests {
             record.current_depth = 1;
             record.current_tip_note_id = already_at.id();
             record.current_tip_nullifier = already_at.nullifier();
-            record.remaining_offered = AssetAmount::new(60).unwrap();
-            record.remaining_requested = AssetAmount::new(30).unwrap();
+            let offered_faucet = pswap.offered_asset().faucet_id();
+            let requested_faucet = pswap.storage().requested_asset().faucet_id();
+            record.remaining_offered =
+                miden_protocol::asset::FungibleAsset::new(offered_faucet, 60).unwrap();
+            record.remaining_requested =
+                miden_protocol::asset::FungibleAsset::new(requested_faucet, 30).unwrap();
             store.upsert_pswap_lineage(&record).await?;
 
             // Sync replays an old depth-1 payback (stale).
@@ -1494,8 +1509,8 @@ mod tests {
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.current_depth, 0, "tampered payback must NOT advance the lineage");
             assert_eq!(lineage.state, PswapLineageState::Active);
-            assert_eq!(lineage.remaining_offered, AssetAmount::new(100).unwrap());
-            assert_eq!(lineage.remaining_requested, AssetAmount::new(50).unwrap());
+            assert_eq!(lineage.remaining_offered.amount(), AssetAmount::new(100).unwrap());
+            assert_eq!(lineage.remaining_requested.amount(), AssetAmount::new(50).unwrap());
             Ok(())
         }
 

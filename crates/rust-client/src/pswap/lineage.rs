@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use miden_protocol::Felt;
 use miden_protocol::Word;
 use miden_protocol::account::AccountId;
-use miden_protocol::asset::{AssetAmount, FungibleAsset};
+use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{Note, NoteId, NoteInclusionProof, NoteTag, NoteType, Nullifier};
 use miden_standards::note::PswapNote;
@@ -82,19 +82,14 @@ pub struct PswapLineageRecord {
     /// 0 for the original tip; increments by 1 each round. Matches the
     /// protocol's `PswapNoteAttachment::depth()` (u32).
     pub current_depth: u32,
-    /// Offered-asset units still unfilled at this point in the chain. Starts
-    /// at `original_pswap.offered_asset().amount()` and decreases by the
-    /// per-round `payout_amount` until reaching zero. Typed as
-    /// [`AssetAmount`] so the `<= AssetAmount::MAX` invariant is enforced
-    /// at every construction site; SQLite still stores as INTEGER bytes
-    /// — the conversion happens at the row decoder
-    /// ([`build_record_from_columns`]).
-    pub remaining_offered: AssetAmount,
-    /// Requested-asset units still unfilled. Starts at
-    /// `original_pswap.storage().requested_asset_amount()` and decreases by
-    /// the per-round `fill_amount`. See [`Self::remaining_offered`] for
-    /// notes on the `AssetAmount` boundary.
-    pub remaining_requested: AssetAmount,
+    /// Offered-asset balance still unfilled. Decreases by per-round
+    /// `payout_amount`. Same faucet as `original_pswap.offered_asset()`;
+    /// the amount is what SQLite persists, the faucet is derived from
+    /// `original_pswap` on every read.
+    pub remaining_offered: FungibleAsset,
+    /// Requested-asset balance still unfilled. Decreases by per-round
+    /// `fill_amount`. Same faucet as `original_pswap.requested_asset()`.
+    pub remaining_requested: FungibleAsset,
 
     /// Current lifecycle state — see [`PswapLineageState`].
     pub state: PswapLineageState,
@@ -199,19 +194,16 @@ pub struct PswapLineageRoundUpdate {
     /// Account that consumed the previous tip and emitted the new outputs.
     /// For a reclaim, equals the creator.
     pub consumer_account_id: AccountId,
-    /// Requested-asset units the consumer filled this round. Read from
-    /// the payback's attachment word slot `[0]`; falls back to
-    /// `previous_remaining_requested` for a terminal full-fill that emits
-    /// no remainder.
-    pub fill_amount: AssetAmount,
-    /// Offered-asset units paid out to the consumer this round. Read from
-    /// the remainder's attachment word slot `[0]`; equals
-    /// `previous_remaining_offered` for a terminal full-fill or a reclaim.
-    pub payout_amount: AssetAmount,
-    /// Remaining offered-asset units AFTER this round (0 on full fill / reclaim).
-    pub remaining_offered: AssetAmount,
-    /// Remaining requested-asset units AFTER this round (0 on full fill / reclaim).
-    pub remaining_requested: AssetAmount,
+    /// Requested-asset balance the consumer filled this round (same faucet
+    /// as `original_pswap.requested_asset()`).
+    pub fill_amount: FungibleAsset,
+    /// Offered-asset balance paid out to the consumer this round (same
+    /// faucet as `original_pswap.offered_asset()`).
+    pub payout_amount: FungibleAsset,
+    /// Remaining offered-asset balance AFTER this round (0 on full fill / reclaim).
+    pub remaining_offered: FungibleAsset,
+    /// Remaining requested-asset balance AFTER this round (0 on full fill / reclaim).
+    pub remaining_requested: FungibleAsset,
     /// Lineage state AFTER this round: `Active` if a remainder was emitted,
     /// `FullyFilled` if requested side exhausted, `Reclaimed` if consumer == creator
     /// with no outputs.
@@ -284,17 +276,22 @@ pub fn build_record_from_columns(
     created_at_block: BlockNumber,
     updated_at_block: BlockNumber,
 ) -> Result<PswapLineageRecord, PswapLineageError> {
-    // Validate the `<= AssetAmount::MAX` invariant at this single boundary
-    // — a row exceeding MAX is corruption (or legacy from before typing).
-    let to_amount = |raw: u64, field: &'static str| -> Result<AssetAmount, PswapLineageError> {
-        AssetAmount::new(raw).map_err(|err| {
-            PswapLineageError::InconsistentRow(format!(
-                "{field} = {raw} exceeds AssetAmount::MAX: {err}"
-            ))
-        })
-    };
-    let remaining_offered = to_amount(remaining_offered, "remaining_offered")?;
-    let remaining_requested = to_amount(remaining_requested, "remaining_requested")?;
+    // Combine the persisted u64 amounts with the faucets from `original_pswap`
+    // to build typed `FungibleAsset`s. The faucets are invariant across the
+    // chain's lifetime, so storing them per-row would be redundant.
+    let to_asset =
+        |raw: u64, faucet: AccountId, field: &'static str| -> Result<FungibleAsset, PswapLineageError> {
+            FungibleAsset::new(faucet, raw).map_err(|err| {
+                PswapLineageError::InconsistentRow(format!(
+                    "{field} = {raw} (faucet {faucet}) failed FungibleAsset construction: {err}"
+                ))
+            })
+        };
+    let offered_faucet = original_pswap.offered_asset().faucet_id();
+    let requested_faucet = original_pswap.storage().requested_asset().faucet_id();
+    let remaining_offered = to_asset(remaining_offered, offered_faucet, "remaining_offered")?;
+    let remaining_requested =
+        to_asset(remaining_requested, requested_faucet, "remaining_requested")?;
 
     Ok(PswapLineageRecord {
         original_pswap,
@@ -375,6 +372,7 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use miden_protocol::Word;
+    use miden_protocol::asset::AssetAmount;
 
     use super::test_helpers::{build_test_pswap, fixed_account_ids};
     use super::*;
@@ -433,8 +431,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(record.current_depth, 0);
-        assert_eq!(record.remaining_offered, AssetAmount::new(100).unwrap());
-        assert_eq!(record.remaining_requested, AssetAmount::new(50).unwrap());
+        assert_eq!(record.remaining_offered.amount(), AssetAmount::new(100).unwrap());
+        assert_eq!(record.remaining_requested.amount(), AssetAmount::new(50).unwrap());
         assert_eq!(record.state, PswapLineageState::Active);
     }
 
@@ -459,7 +457,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(record.current_depth, 3);
-        assert_eq!(record.remaining_offered, AssetAmount::new(70).unwrap());
+        assert_eq!(record.remaining_offered.amount(), AssetAmount::new(70).unwrap());
     }
 
     /// Unknown state discriminant in the row bubbles up as `UnknownState`.
@@ -504,13 +502,15 @@ mod tests {
             );
 
         let note = miden_protocol::note::Note::from(pswap.clone());
+        let remaining_offered = pswap.offered_asset().clone();
+        let remaining_requested = pswap.storage().requested_asset().clone();
         let record = PswapLineageRecord {
             original_pswap: pswap,
             current_tip_note_id: note.id(),
             current_tip_nullifier: note.nullifier(),
             current_depth: 0,
-            remaining_offered: AssetAmount::new(100).unwrap(),
-            remaining_requested: AssetAmount::new(50).unwrap(),
+            remaining_offered,
+            remaining_requested,
             state: PswapLineageState::Active,
             created_at_block: BlockNumber::from(0),
             updated_at_block: BlockNumber::from(0),

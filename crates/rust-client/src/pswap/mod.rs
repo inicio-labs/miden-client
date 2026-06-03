@@ -111,19 +111,15 @@ fn build_initial_lineage_record(
     pswap: &PswapNote,
     submission_height: BlockNumber,
 ) -> PswapLineageRecord {
+    // At creation, remaining_* == initial offered/requested. Both are already
+    // FungibleAssets on the PswapNote.
     PswapLineageRecord {
         original_pswap: pswap.clone(),
         current_tip_note_id: note.id(),
         current_tip_nullifier: note.nullifier(),
         current_depth: 0,
-        remaining_offered: pswap.offered_asset().amount(),
-        // `requested_asset_amount()` returns u64 (legacy shape on
-        // `PswapNoteStorage`); the value originated from a validated
-        // `FungibleAsset` so it's always ≤ `AssetAmount::MAX`.
-        remaining_requested: miden_protocol::asset::AssetAmount::new(
-            pswap.storage().requested_asset_amount(),
-        )
-        .expect("PSWAP storage's requested_asset_amount is bounded by FungibleAsset's invariant"),
+        remaining_offered: pswap.offered_asset().clone(),
+        remaining_requested: pswap.storage().requested_asset().clone(),
         state: PswapLineageState::Active,
         created_at_block: submission_height,
         updated_at_block: submission_height,

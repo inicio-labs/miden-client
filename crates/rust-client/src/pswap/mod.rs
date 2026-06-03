@@ -61,7 +61,7 @@ impl TransactionObserver for PswapTransactionObserver {
         "PswapTransactionObserver"
     }
 
-    async fn observe(
+    async fn apply(
         &self,
         tx_result: &TransactionResult,
         submission_height: BlockNumber,

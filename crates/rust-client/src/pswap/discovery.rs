@@ -110,7 +110,7 @@ pub async fn discover_pswap_rounds(
 fn build_round_update(
     lineage: &PswapLineageRecord,
     round_depth: u32,
-    at_block_number: BlockNumber,
+    block_number: BlockNumber,
     notes: &[&PswapChainNoteUpdate],
 ) -> Result<Option<PswapLineageRoundUpdate>, ClientError> {
     let pswap = &lineage.original_pswap;
@@ -132,7 +132,7 @@ fn build_round_update(
                 remaining_requested: zero_requested,
                 state: PswapLineageState::Reclaimed,
                 tip_note_id: None,
-                at_block: at_block_number,
+                at_block: block_number,
                 payback: None,
                 payback_inclusion_proof: None,
                 remainder: None,
@@ -161,7 +161,7 @@ fn build_round_update(
                 remaining_requested: zero_requested,
                 state: PswapLineageState::FullyFilled,
                 tip_note_id: None,
-                at_block: at_block_number,
+                at_block: block_number,
                 payback: Some(payback),
                 payback_inclusion_proof: Some(payback_note_update.inclusion_proof.clone()),
                 remainder: None,
@@ -216,7 +216,7 @@ fn build_round_update(
                 remaining_requested,
                 state: PswapLineageState::Active,
                 tip_note_id: Some(remainder_note_update.note_id),
-                at_block: at_block_number,
+                at_block: block_number,
                 payback: Some(payback_note),
                 payback_inclusion_proof: Some(payback_note_update.inclusion_proof.clone()),
                 remainder: Some(remainder_note),

@@ -13,21 +13,17 @@ use miden_protocol::block::BlockNumber;
 use crate::ClientError;
 use crate::transaction::TransactionResult;
 
-/// Side-effect-only observer of committed transactions.
-///
-/// Attached to [`crate::Client`] via `Client::with_transaction_observer(...)`.
-/// `observe()` runs once per transaction, AFTER the transaction's standard
-/// updates have been persisted. Errors are logged (tagged with
-/// [`Self::name`]) and never abort `apply_transaction`.
+/// Side-effect-only observer of committed transactions. `apply()` runs
+/// once per `apply_transaction` AFTER the standard updates land. Errors
+/// are logged (tagged with [`Self::name`]) and never abort sync.
 #[async_trait(?Send)]
 pub trait TransactionObserver: Send + Sync {
-    /// Short identifier for `tracing::warn!` events on `observe()` errors.
+    /// Short identifier for `tracing::warn!` events on `apply()` errors.
     fn name(&self) -> &'static str;
 
-    /// Called once per `apply_transaction`, after the transaction's effects
-    /// have been written to the store. Return `Ok(())` for "not interested";
-    /// reserve `Err(_)` for genuine internal failures.
-    async fn observe(
+    /// Return `Ok(())` for "not interested"; reserve `Err(_)` for genuine
+    /// internal failures.
+    async fn apply(
         &self,
         tx_result: &TransactionResult,
         submission_height: BlockNumber,

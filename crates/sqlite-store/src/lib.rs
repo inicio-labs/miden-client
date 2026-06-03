@@ -567,32 +567,27 @@ impl Store for SqliteStore {
         .await
     }
 
-    // PSWAP LINEAGES
-    // --------------------------------------------------------------------------------------------
-    //
-    // Bodies live in `pswap::store_impl` to keep PSWAP code out of lib.rs.
-
+    // PSWAP LINEAGES — bodies live in `crate::pswap::store_impl`. Rust's
+    // single-impl-per-trait rule + `#[async_trait]` proc-macro expansion
+    // order force the stubs to live here; they delegate one-liners.
     async fn upsert_pswap_lineage(
         &self,
         record: &miden_client::pswap::PswapLineageRecord,
     ) -> Result<(), StoreError> {
         crate::pswap::store_impl::upsert_pswap_lineage(self, record).await
     }
-
     async fn get_pswap_lineage(
         &self,
         order_id: Felt,
     ) -> Result<Option<miden_client::pswap::PswapLineageRecord>, StoreError> {
         crate::pswap::store_impl::get_pswap_lineage(self, order_id).await
     }
-
     async fn list_pswap_lineages(
         &self,
         filter: miden_client::pswap::PswapLineageFilter,
     ) -> Result<Vec<miden_client::pswap::PswapLineageRecord>, StoreError> {
         crate::pswap::store_impl::list_pswap_lineages(self, filter).await
     }
-
     async fn apply_pswap_round(
         &self,
         update: &miden_client::pswap::PswapLineageRoundUpdate,

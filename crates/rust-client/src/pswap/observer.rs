@@ -15,7 +15,6 @@ use miden_standards::note::PswapNote;
 use tracing::warn;
 
 use crate::ClientError;
-use crate::pswap::PswapLineageState;
 use crate::rpc::NodeRpcClient;
 use crate::rpc::domain::note::{CommittedNote, FetchedNote};
 use crate::store::Store;
@@ -96,12 +95,15 @@ impl NoteObserver for PswapChainObserver {
     }
 
     async fn observe(&self, committed_note: &CommittedNote) -> Result<(), ClientError> {
-        let has_pswap_attachment = committed_note
+        // PSWAP notes carry exactly one attachment (the PSWAP one), so
+        // the first header is the only candidate.
+        let is_pswap = committed_note
             .metadata()
             .attachment_headers()
-            .iter()
-            .any(|h| h.scheme() == Some(PswapNote::PSWAP_ATTACHMENT_SCHEME));
-        if !has_pswap_attachment {
+            .first()
+            .and_then(|h| h.scheme())
+            == Some(PswapNote::PSWAP_ATTACHMENT_SCHEME);
+        if !is_pswap {
             return Ok(());
         }
 
@@ -161,8 +163,10 @@ impl NoteObserver for PswapChainObserver {
 }
 
 impl PswapChainObserver {
-    /// Batched `GetNotesById` → extract attachments → filter to our active
-    /// lineages → build chain note updates.
+    /// Batched `GetNotesById` → extract attachments → return all PSWAP-
+    /// attachment chain notes. Filtering to *our* active lineages happens
+    /// in `discovery` (it already loads them and walks by `(order_id,
+    /// depth)`, so foreign-order notes are naturally ignored).
     async fn build_chain_note_updates(
         &self,
         pending: Vec<PendingPswapNote>,
@@ -172,27 +176,12 @@ impl PswapChainObserver {
 
         let mut updates = Vec::with_capacity(fetched.len());
         for fetched_note in fetched {
-            // Skip notes the node returned but we didn't ask about.
             let Some(pending_rec) = pending.iter().find(|p| p.note_id == fetched_note.id()) else {
                 continue;
             };
-
-            // Soft-skip if attachment is missing or malformed.
             let Some((order_id, depth, amount)) = extract_pswap_attachment(&fetched_note) else {
                 continue;
             };
-
-            // Reject foreign / terminated lineages.
-            let lineage = match self.store.get_pswap_lineage(order_id).await? {
-                Some(l) if l.state == PswapLineageState::Active => l,
-                _ => continue,
-            };
-
-            // Forward-only depth.
-            if depth < lineage.current_depth + 1 {
-                continue;
-            }
-
             updates.push(PswapChainNoteUpdate {
                 note_id: pending_rec.note_id,
                 order_id,

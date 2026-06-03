@@ -889,18 +889,21 @@ impl StateSync {
                 .flatten()
                 .cloned();
 
-            // The screener consumes `committed_note` by value (it threads
-            // the note back through `NoteUpdateAction::Commit(...)`).
-            // Observers need their own handle since they may run after a
-            // `Discard` verdict that drops the note entirely. Clone once
-            // here; `CommittedNote` is cheap to clone (metadata + ids,
-            // not full note bodies). If `note_observers` is empty (the
-            // common case for clients with no PSWAP / dApp features
-            // attached), the clone is wasted but the alternative —
-            // duplicating the loop body across "has observers" /
-            // "doesn't" — would be uglier.
-            let note_for_observers = (!self.note_observers.is_empty())
-                .then(|| committed_note.clone());
+            // Observers run BEFORE the screener: they are a side-effect
+            // channel independent of the Commit/Insert/Discard decision,
+            // and a failing screener must not rob them of the note. Clone
+            // is skipped when no observers are attached (the common case).
+            if !self.note_observers.is_empty() {
+                for obs in &self.note_observers {
+                    if let Err(err) = obs.observe(&committed_note).await {
+                        tracing::warn!(
+                            observer = obs.name(),
+                            error = ?err,
+                            "note observer failed; sync continues",
+                        );
+                    }
+                }
+            }
 
             match self.note_screener.on_note_received(committed_note, public_note).await? {
                 NoteUpdateAction::Commit(committed_note) => {
@@ -920,22 +923,6 @@ impl StateSync {
                     note_updates.apply_new_public_note(public_note, block_header)?;
                 },
                 NoteUpdateAction::Discard => {},
-            }
-
-            // Fan out to observers after the screener has decided. Errors
-            // are logged via tracing and never abort sync (see
-            // `NoteObserver` trait doc). Observers run in attachment
-            // order; ordering between them is not part of the contract.
-            if let Some(note_for_observers) = note_for_observers {
-                for obs in &self.note_observers {
-                    if let Err(err) = obs.observe(&note_for_observers).await {
-                        tracing::warn!(
-                            observer = obs.name(),
-                            error = ?err,
-                            "note observer failed; sync continues",
-                        );
-                    }
-                }
             }
         }
 

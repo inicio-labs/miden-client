@@ -78,8 +78,7 @@ pub enum NoteTagSource {
     Note(NoteDetailsCommitment),
     /// Tag manually added by the user.
     User,
-    /// Subscription tag scoped to an anchor [`NoteId`] (e.g. the original
-    /// PSWAP). Inserted on subscribe, removed on unsubscribe.
+    /// Subscription tag anchored to a [`NoteId`].
     Subscription(NoteId),
 }
 

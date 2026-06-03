@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
@@ -179,12 +180,22 @@ pub enum ClientError {
         #[source]
         source: RpcError,
     },
+    /// Generic carrier for feature-specific errors raised by an observer
+    /// or domain module. Keeps `ClientError` free of per-feature variants;
+    /// each feature provides its own `From<MyFeatureError> for ClientError`
+    /// returning `Observer(Box::new(err))`.
     #[error(transparent)]
-    PswapLineageError(#[from] crate::pswap::PswapLineageError),
+    Observer(Box<dyn core::error::Error + Send + Sync + 'static>),
 }
 
 // CONVERSIONS
 // ================================================================================================
+
+impl From<crate::pswap::PswapLineageError> for ClientError {
+    fn from(err: crate::pswap::PswapLineageError) -> Self {
+        ClientError::Observer(Box::new(err))
+    }
+}
 
 impl From<ClientError> for String {
     fn from(err: ClientError) -> String {

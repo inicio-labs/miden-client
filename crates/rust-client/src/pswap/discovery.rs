@@ -9,7 +9,6 @@
 //! executable contract this correlator implements at runtime.
 
 use alloc::collections::BTreeMap;
-use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -46,19 +45,18 @@ pub async fn discover_pswap_rounds(
     state_sync_update: &StateSyncUpdate,
     chain_note_updates: &[PswapChainNoteUpdate],
 ) -> Result<Vec<PswapLineageRoundUpdate>, ClientError> {
+    // Derive (nullifier, block) pairs for this sync's tracked-note consumptions
+    // from `note_updates` — true positives only, no prefix-collision noise.
+    let nullifier_to_block: BTreeMap<Nullifier, BlockNumber> =
+        state_sync_update.note_updates.consumed_nullifier_blocks().collect();
+
     // Most syncs have no PSWAP activity — skip the store query.
-    if state_sync_update.current_window_nullifier_blocks.is_empty()
-        && chain_note_updates.is_empty()
-    {
+    if nullifier_to_block.is_empty() && chain_note_updates.is_empty() {
         return Ok(Vec::new());
     }
 
     // Load only lineages whose tip is in this sync window.
-    let consumed_nullifiers: Vec<Nullifier> = state_sync_update
-        .current_window_nullifier_blocks
-        .iter()
-        .map(|(nullifier, _)| *nullifier)
-        .collect();
+    let consumed_nullifiers: Vec<Nullifier> = nullifier_to_block.keys().copied().collect();
     let active_lineages = store
         .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(consumed_nullifiers))
         .await?;
@@ -75,13 +73,6 @@ pub async fn discover_pswap_rounds(
             .or_insert_with(Vec::new)
             .push(note);
     }
-
-    // Tip-nullifier → block-of-consumption.
-    let nullifier_to_block: BTreeMap<Nullifier, BlockNumber> = state_sync_update
-        .current_window_nullifier_blocks
-        .iter()
-        .copied()
-        .collect();
 
     let mut round_updates: Vec<PswapLineageRoundUpdate> = Vec::new();
 

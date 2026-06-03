@@ -43,15 +43,6 @@ pub struct StateSyncUpdate {
     pub transaction_updates: TransactionUpdateTracker,
     /// Public account updates and mismatched private accounts after the sync.
     pub account_updates: AccountUpdates,
-    /// Raw `(nullifier, block)` events from this sync window's `sync_nullifiers`
-    /// RPC response. Includes 16-bit-prefix collisions that aren't our notes.
-    ///
-    /// Equivalent true-positive info is derivable from `note_updates` (per-note
-    /// state transitions carry the consumed-at block), but only for notes we
-    /// already tracked. This flat list keeps the raw stream available for
-    /// downstream consumers (currently PSWAP chain tracking).
-    /// Empty when nullifier sync is disabled.
-    pub current_window_nullifier_blocks: Vec<(Nullifier, BlockNumber)>,
 }
 
 impl From<&StateSyncUpdate> for SyncSummary {

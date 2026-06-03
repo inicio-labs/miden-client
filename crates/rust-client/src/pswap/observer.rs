@@ -125,8 +125,11 @@ impl NoteObserver for PswapChainObserver {
     ) -> Result<(), ClientError> {
         let pending = core::mem::take(&mut *self.pending_pswap_notes.write());
 
-        // Fast path: nothing PSWAP-related happened this sync.
-        if pending.is_empty() && sync_update.current_window_nullifier_blocks.is_empty() {
+        // Fast path: no observed PSWAP notes AND no tracked-note consumptions
+        // — nothing for the correlator to do.
+        if pending.is_empty()
+            && sync_update.note_updates.consumed_nullifier_blocks().next().is_none()
+        {
             return Ok(());
         }
 

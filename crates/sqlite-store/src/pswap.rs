@@ -985,15 +985,57 @@ mod tests {
             })
         }
 
-        /// Builds a `StateSyncUpdate` whose only populated field is the
-        /// consumed-nullifier window. Sufficient for the PSWAP correlator path.
-        fn nullifier_window(entries: Vec<(miden_client::note::Nullifier, u32)>) -> StateSyncUpdate {
-            let mut update = StateSyncUpdate::default();
-            update.current_window_nullifier_blocks = entries
+        /// Builds a `StateSyncUpdate` whose `note_updates` carries the given
+        /// notes as already-consumed input notes at the given blocks. The
+        /// PSWAP correlator reads consumed `(nullifier, block)` pairs via
+        /// `note_updates.consumed_nullifier_blocks()`.
+        ///
+        /// Uses `ConsumedUnauthenticatedLocal` (not `ConsumedExternal`)
+        /// because the test path inserts the record afresh — that variant
+        /// retains metadata, which `NoteUpdateTracker::insert_input_note`
+        /// requires to populate the by-nullifier index that
+        /// `consumed_nullifier_blocks()` iterates.
+        fn nullifier_window(entries: Vec<(&Note, u32)>) -> StateSyncUpdate {
+            use miden_client::account::AccountId;
+            use miden_client::note::NoteDetails;
+            use miden_client::store::InputNoteRecord;
+            use miden_client::store::input_note_states::{
+                ConsumedUnauthenticatedLocalNoteState,
+                NoteSubmissionData,
+            };
+            use miden_protocol::transaction::TransactionId;
+            use miden_protocol::Word;
+
+            let dummy_consumer =
+                AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
+            let dummy_tx = TransactionId::from_raw(Word::default());
+
+            let updated_input_notes: Vec<InputNoteRecord> = entries
                 .into_iter()
-                .map(|(n, b)| (n, BlockNumber::from(b)))
+                .map(|(note, block)| {
+                    let details = NoteDetails::from(note.clone());
+                    let attachments = note.attachments().clone();
+                    let state = ConsumedUnauthenticatedLocalNoteState {
+                        metadata: *note.metadata(),
+                        nullifier_block_height: BlockNumber::from(block),
+                        submission_data: NoteSubmissionData {
+                            submitted_at: None,
+                            consumer_account: dummy_consumer,
+                            consumer_transaction: dummy_tx,
+                        },
+                        consumed_tx_order: None,
+                    }
+                    .into();
+                    InputNoteRecord::new(details, attachments, None, state)
+                })
                 .collect();
-            update
+
+            let note_updates = miden_client::note::NoteUpdateTracker::for_transaction_updates(
+                Vec::new(),
+                updated_input_notes,
+                Vec::new(),
+            );
+            StateSyncUpdate { note_updates, ..StateSyncUpdate::default() }
         }
 
         /// Bob's account id — used as the consumer in every scenario.
@@ -1025,7 +1067,6 @@ mod tests {
             let lineage_record = super::build_initial_record(pswap.clone());
             store.upsert_pswap_lineage(&lineage_record).await?;
             // PswapNote doesn't expose nullifier directly — derive it from the Note view.
-            let p0_nullifier = Note::from(pswap.clone()).nullifier();
 
             // 2. Bob's payback + remainder for the partial fill at depth 1.
             let fill_amount = AssetAmount::new(20).unwrap();
@@ -1081,12 +1122,9 @@ mod tests {
             observer.observe(&payback_committed).await?;
             observer.observe(&remainder_committed).await?;
 
-            // P0's nullifier IS in the consumed window (Bob consumed P0).
-            let mut sync_update = StateSyncUpdate::default();
-            sync_update.current_window_nullifier_blocks =
-                vec![(p0_nullifier, BlockNumber::from(5))];
-
-            observer.apply(&sync_update).await?;
+            // P0 was consumed by Bob this sync.
+            let p0_note = Note::from(pswap.clone());
+            observer.apply(&nullifier_window(vec![(&p0_note, 5)])).await?;
 
             // 5. Assert: lineage in store advanced to depth 1.
             let lineage = store
@@ -1127,7 +1165,6 @@ mod tests {
             let store: Arc<dyn Store> = Arc::new(create_test_store().await);
             let pswap = build_private_test_pswap(100, 50);
             store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
-            let p0_nullifier = Note::from(pswap.clone()).nullifier();
 
             // Bob fills the entire 50 RA → 1 payback note (50 RA to Alice).
             let fill_amount = AssetAmount::new(50).unwrap();
@@ -1140,7 +1177,8 @@ mod tests {
                 build_mock_rpc(vec![(payback.id(), fetched_private(&payback, &inclusion_proof))]),
             );
             observer.observe(&commit_note(&payback, &inclusion_proof)).await?;
-            observer.apply(&nullifier_window(vec![(p0_nullifier, 7)])).await?;
+            let p0_note = Note::from(pswap.clone());
+            observer.apply(&nullifier_window(vec![(&p0_note, 7)])).await?;
 
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.current_depth, 1);
@@ -1158,11 +1196,11 @@ mod tests {
             let store: Arc<dyn Store> = Arc::new(create_test_store().await);
             let pswap = build_private_test_pswap(100, 50);
             store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
-            let p0_nullifier = Note::from(pswap.clone()).nullifier();
 
             // No notes emitted by reclaim → empty mock RPC, no `observe()` calls.
             let observer = PswapChainObserver::new(store.clone(), build_mock_rpc(vec![]));
-            observer.apply(&nullifier_window(vec![(p0_nullifier, 9)])).await?;
+            let p0_note = Note::from(pswap.clone());
+            observer.apply(&nullifier_window(vec![(&p0_note, 9)])).await?;
 
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.state, PswapLineageState::Reclaimed);
@@ -1181,7 +1219,6 @@ mod tests {
             let store: Arc<dyn Store> = Arc::new(create_test_store().await);
             let pswap = build_private_test_pswap(100, 50);
             store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
-            let p0_nullifier = Note::from(pswap.clone()).nullifier();
 
             // Round 1: Bob partial-fill (fill=20, payout=40) → payback + remainder.
             let p1_attach = PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1);
@@ -1209,9 +1246,10 @@ mod tests {
             observer.observe(&commit_note(&payback_2, &inclusion_proof)).await?;
 
             // BOTH P0 and the round-1 remainder are in the consumed window.
+            let p0_note = Note::from(pswap.clone());
             observer.apply(&nullifier_window(vec![
-                (p0_nullifier, 15),
-                (remainder_1.nullifier(), 15),
+                (&p0_note, 15),
+                (&remainder_1, 15),
             ])).await?;
 
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
@@ -1285,8 +1323,8 @@ mod tests {
             // We see the note arrive in sync.
             observer.observe(&commit_note(&foreign_payback, &inclusion_proof)).await?;
             // And the foreign PSWAP's nullifier is in the consumed window.
-            let foreign_p0_null = Note::from(foreign.clone()).nullifier();
-            observer.apply(&nullifier_window(vec![(foreign_p0_null, 5)])).await?;
+            let foreign_p0_note = Note::from(foreign.clone());
+            observer.apply(&nullifier_window(vec![(&foreign_p0_note, 5)])).await?;
 
             // Store must remain empty — we never tracked this lineage.
             assert!(
@@ -1363,8 +1401,6 @@ mod tests {
             let mut record = super::build_initial_record(pswap.clone());
             record.state = PswapLineageState::FullyFilled;
             store.upsert_pswap_lineage(&record).await?;
-            let p0_nullifier = Note::from(pswap.clone()).nullifier();
-
             // Attempt to replay a fill on the terminal lineage.
             let zombie_payback = pswap.payback_note(
                 bob(),
@@ -1379,7 +1415,8 @@ mod tests {
                 )]),
             );
             observer.observe(&commit_note(&zombie_payback, &inclusion_proof)).await?;
-            observer.apply(&nullifier_window(vec![(p0_nullifier, 30)])).await?;
+            let p0_note = Note::from(pswap.clone());
+            observer.apply(&nullifier_window(vec![(&p0_note, 30)])).await?;
 
             // State unchanged: still FullyFilled at the same depth.
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();

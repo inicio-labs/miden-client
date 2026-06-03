@@ -287,8 +287,7 @@ CREATE TABLE pswap_lineages (
     original_pswap            BLOB    NOT NULL,  -- serialised PswapNote (source of truth for every initial-* field)
 
     -- Live tip state.
-    current_tip_note_id       TEXT    NOT NULL,                  -- hex; matches sibling tables' note_id format
-    current_tip_nullifier     TEXT    NOT NULL,                  -- hex; indexed for fast lookup during sync
+    current_tip_note_id       TEXT    NOT NULL,                  -- hex; matches sibling tables' note_id format; indexed for fast lookup during sync
     current_depth             UNSIGNED BIG INT NOT NULL,         -- u32, 0 for the original tip
     remaining_offered         UNSIGNED BIG INT NOT NULL,         -- AssetAmount as u64; validated <= AssetAmount::MAX on read
     remaining_requested       UNSIGNED BIG INT NOT NULL,         -- AssetAmount as u64; validated <= AssetAmount::MAX on read
@@ -300,5 +299,5 @@ CREATE TABLE pswap_lineages (
     PRIMARY KEY (order_id)
 ) WITHOUT ROWID;
 
-CREATE INDEX idx_pswap_lineages_state          ON pswap_lineages(state);
-CREATE INDEX idx_pswap_lineages_tip_nullifier  ON pswap_lineages(current_tip_nullifier);
+CREATE INDEX idx_pswap_lineages_state         ON pswap_lineages(state);
+CREATE INDEX idx_pswap_lineages_tip_note_id   ON pswap_lineages(current_tip_note_id);

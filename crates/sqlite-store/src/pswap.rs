@@ -8,7 +8,7 @@ use std::vec::Vec;
 
 #[cfg(test)]
 use miden_client::account::AccountId;
-use miden_client::note::{BlockNumber, Note, NoteId, Nullifier, PswapNote};
+use miden_client::note::{BlockNumber, Note, NoteId, PswapNote};
 use miden_client::pswap::{
     PswapLineageError,
     PswapLineageFilter,
@@ -64,10 +64,10 @@ impl SqliteStore {
         conn: &mut Connection,
         filter: PswapLineageFilter,
     ) -> Result<Vec<PswapLineageRecord>, StoreError> {
-        // `ActiveByTipNullifiers` has a dynamic IN-list — separate path avoids
+        // `ActiveByTipNoteIds` has a dynamic IN-list — separate path avoids
         // bloating the prepared-statement cache.
-        if let PswapLineageFilter::ActiveByTipNullifiers(nullifiers) = &filter {
-            return list_active_by_tip_nullifiers(conn, nullifiers);
+        if let PswapLineageFilter::ActiveByTipNoteIds(note_ids) = &filter {
+            return list_active_by_tip_note_ids(conn, note_ids);
         }
 
         // `ByCreator` is filtered in Rust because the creator lives inside
@@ -87,7 +87,7 @@ impl SqliteStore {
             PswapLineageFilter::ByOrderId(order_id) => {
                 collect_rows(stmt.query(params![order_id.to_bytes()]).into_store_error()?)?
             },
-            PswapLineageFilter::ActiveByTipNullifiers(_) => unreachable!("handled above"),
+            PswapLineageFilter::ActiveByTipNoteIds(_) => unreachable!("handled above"),
         };
 
         Ok(rows)
@@ -178,7 +178,7 @@ fn remove_pswap_asset_pair_tag_tx(
 // -------------------------------------------------------------------------------------------
 
 const SELECT_LINEAGE_COLUMNS_PREFIX: &str = "\
-SELECT order_id, original_pswap, current_tip_note_id, current_tip_nullifier, \
+SELECT order_id, original_pswap, current_tip_note_id, \
        current_depth, remaining_offered, remaining_requested, state, \
        created_at_block, updated_at_block \
 FROM pswap_lineages";
@@ -188,37 +188,37 @@ fn sql_filter_part(filter: &PswapLineageFilter) -> &'static str {
         PswapLineageFilter::All | PswapLineageFilter::ByCreator(_) => "",
         PswapLineageFilter::Active => " WHERE state = ?",
         PswapLineageFilter::ByOrderId(_) => " WHERE order_id = ?",
-        // ActiveByTipNullifiers builds its SQL dynamically — see
-        // list_active_by_tip_nullifiers — and never routes through here.
-        PswapLineageFilter::ActiveByTipNullifiers(_) => "",
+        // ActiveByTipNoteIds builds its SQL dynamically — see
+        // list_active_by_tip_note_ids — and never routes through here.
+        PswapLineageFilter::ActiveByTipNoteIds(_) => "",
     }
 }
 
-/// Loads `Active` lineages whose `current_tip_nullifier` is in `nullifiers`.
+/// Loads `Active` lineages whose `current_tip_note_id` is in `note_ids`.
 /// SQLite's default param limit (32 766) dwarfs typical sync windows; we
 /// don't chunk. `prepare` (not `prepare_cached`) keeps per-N SQL out of
 /// the cache.
-fn list_active_by_tip_nullifiers(
+fn list_active_by_tip_note_ids(
     conn: &mut Connection,
-    nullifiers: &[Nullifier],
+    note_ids: &[NoteId],
 ) -> Result<Vec<PswapLineageRecord>, StoreError> {
-    if nullifiers.is_empty() {
+    if note_ids.is_empty() {
         return Ok(Vec::new());
     }
     let placeholders = std::iter::repeat("?")
-        .take(nullifiers.len())
+        .take(note_ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = std::format!(
         "{SELECT_LINEAGE_COLUMNS_PREFIX} \
-         WHERE state = {state} AND current_tip_nullifier IN ({placeholders})",
+         WHERE state = {state} AND current_tip_note_id IN ({placeholders})",
         state = PswapLineageState::Active.as_u8(),
     );
     let mut stmt = conn.prepare(&sql).into_store_error()?;
-    let nullifier_texts: Vec<String> =
-        nullifiers.iter().map(|n| n.as_word().to_string()).collect();
+    let note_id_texts: Vec<String> =
+        note_ids.iter().map(|n| n.as_word().to_string()).collect();
     let rows = stmt
-        .query(rusqlite::params_from_iter(nullifier_texts.iter()))
+        .query(rusqlite::params_from_iter(note_id_texts.iter()))
         .into_store_error()?;
     collect_rows(rows)
 }
@@ -234,13 +234,12 @@ fn collect_rows(mut rows: rusqlite::Rows<'_>) -> Result<Vec<PswapLineageRecord>,
 fn record_from_row(row: &Row<'_>) -> Result<PswapLineageRecord, StoreError> {
     let original_pswap_bytes: Vec<u8> = row.get(1).into_store_error()?;
     let current_tip_text: String = row.get(2).into_store_error()?;
-    let nullifier_text: String = row.get(3).into_store_error()?;
-    let current_depth: u32 = row.get(4).into_store_error()?;
-    let remaining_offered: u64 = row.get(5).into_store_error()?;
-    let remaining_requested: u64 = row.get(6).into_store_error()?;
-    let state_byte: u8 = row.get(7).into_store_error()?;
-    let created_at_block: u32 = row.get(8).into_store_error()?;
-    let updated_at_block: u32 = row.get(9).into_store_error()?;
+    let current_depth: u32 = row.get(3).into_store_error()?;
+    let remaining_offered: u64 = row.get(4).into_store_error()?;
+    let remaining_requested: u64 = row.get(5).into_store_error()?;
+    let state_byte: u8 = row.get(6).into_store_error()?;
+    let created_at_block: u32 = row.get(7).into_store_error()?;
+    let updated_at_block: u32 = row.get(8).into_store_error()?;
 
     // `PswapNote` does not impl Serializable directly; persist as `Note`
     // and round-trip via the existing conversion.
@@ -251,13 +250,10 @@ fn record_from_row(row: &Row<'_>) -> Result<PswapLineageRecord, StoreError> {
 
     let current_tip_note_id = NoteId::try_from_hex(&current_tip_text)
         .map_err(|err| StoreError::DataDeserializationError(deser_err(err.to_string())))?;
-    let current_tip_nullifier = Nullifier::from_hex(&nullifier_text)
-        .map_err(|err| StoreError::DataDeserializationError(deser_err(err.to_string())))?;
 
     build_record_from_columns(
         original_pswap,
         current_tip_note_id,
-        current_tip_nullifier,
         current_depth,
         remaining_offered,
         remaining_requested,
@@ -278,10 +274,10 @@ fn upsert_pswap_lineage_tx(
 ) -> Result<(), StoreError> {
     const SQL: &str = "\
 INSERT OR REPLACE INTO pswap_lineages \
-(order_id, original_pswap, current_tip_note_id, current_tip_nullifier, \
+(order_id, original_pswap, current_tip_note_id, \
  current_depth, remaining_offered, remaining_requested, state, \
  created_at_block, updated_at_block) \
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     let original_pswap_bytes = Note::from(record.original_pswap.clone()).to_bytes();
 
@@ -291,7 +287,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
             record.order_id().to_bytes(),
             original_pswap_bytes,
             record.current_tip_note_id.as_word().to_string(),
-            record.current_tip_nullifier.to_hex(),
             record.current_depth,
             u64::from(record.remaining_offered.amount()),
             u64::from(record.remaining_requested.amount()),
@@ -336,12 +331,12 @@ fn update_lineage_tip_tx(
 
     let updated_block = update.at_block.as_u32();
 
-    let rows_changed = match (update.tip_note_id, update.tip_nullifier) {
-        (Some(note_id), Some(nullifier)) => {
+    let rows_changed = match update.tip_note_id {
+        Some(note_id) => {
             // Active continuation — new tip overwrites the previous one.
             const SQL: &str = "\
 UPDATE pswap_lineages SET \
- current_tip_note_id = ?, current_tip_nullifier = ?, \
+ current_tip_note_id = ?, \
  current_depth = ?, remaining_offered = ?, remaining_requested = ?, \
  state = ?, updated_at_block = ? \
 WHERE order_id = ?";
@@ -349,7 +344,6 @@ WHERE order_id = ?";
                 .into_store_error()?
                 .execute(params![
                     note_id.as_word().to_string(),
-                    nullifier.to_hex(),
                     update.round_depth,
                     u64::from(update.remaining_offered.amount()),
                     u64::from(update.remaining_requested.amount()),
@@ -359,7 +353,7 @@ WHERE order_id = ?";
                 ])
                 .into_store_error()?
         },
-        _ => {
+        None => {
             // Terminal — keep the existing tip columns for diagnostics.
             const SQL: &str = "\
 UPDATE pswap_lineages SET \
@@ -584,7 +578,6 @@ mod tests {
         PswapLineageRecord {
             original_pswap: pswap,
             current_tip_note_id: note.id(),
-            current_tip_nullifier: note.nullifier(),
             current_depth: 0,
             remaining_offered,
             remaining_requested,
@@ -615,7 +608,6 @@ mod tests {
         // reliably across serialisation boundaries.
         assert_eq!(fetched.order_id(), record.order_id());
         assert_eq!(fetched.current_tip_note_id, record.current_tip_note_id);
-        assert_eq!(fetched.current_tip_nullifier, record.current_tip_nullifier);
         assert_eq!(fetched.current_depth, record.current_depth);
         assert_eq!(fetched.remaining_offered, record.remaining_offered);
         assert_eq!(fetched.remaining_requested, record.remaining_requested);
@@ -654,7 +646,6 @@ mod tests {
             remaining_requested: fa(requested_faucet, 40),
             state: PswapLineageState::Active,
             tip_note_id: Some(record.current_tip_note_id),
-            tip_nullifier: Some(record.current_tip_nullifier),
             at_block: BlockNumber::from(8),
             payback: None,
             payback_inclusion_proof: None,
@@ -700,7 +691,6 @@ mod tests {
             remaining_requested: fa(40),
             state: PswapLineageState::Active,
             tip_note_id: None,
-            tip_nullifier: None,
             at_block: BlockNumber::from(8),
             payback: None,
             payback_inclusion_proof: None,
@@ -747,53 +737,51 @@ mod tests {
         Ok(())
     }
 
-    /// `ActiveByTipNullifiers` returns matching Active lineages only;
+    /// `ActiveByTipNoteIds` returns matching Active lineages only;
     /// well-behaved for empty + non-matching inputs.
     #[tokio::test]
-    async fn list_pswap_lineages_filters_by_tip_nullifiers() -> anyhow::Result<()> {
+    async fn list_pswap_lineages_filters_by_tip_note_ids() -> anyhow::Result<()> {
         let store = create_test_store().await;
 
-        // Insert one Active lineage; capture its tip nullifier.
+        // Insert one Active lineage; capture its tip note id.
         let rec = build_initial_record(build_test_pswap(100, 50));
-        let real_tip = rec.current_tip_nullifier;
+        let real_tip = rec.current_tip_note_id;
         store.upsert_pswap_lineage(&rec).await?;
 
         // Build a second PSWAP we DON'T insert — its tip serves as a
-        // realistic "not in store" sentinel (the test stays oblivious to
-        // Nullifier's construction internals).
+        // "not in store" sentinel.
         let phantom_tip =
-            build_initial_record(build_test_pswap(999, 999)).current_tip_nullifier;
+            build_initial_record(build_test_pswap(999, 999)).current_tip_note_id;
 
         // Empty input: no rows.
         let empty = store
-            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(Vec::new()))
+            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNoteIds(Vec::new()))
             .await?;
-        assert!(empty.is_empty(), "empty nullifier set should return no rows");
+        assert!(empty.is_empty(), "empty note-id set should return no rows");
 
-        // Non-matching nullifier: no rows.
+        // Non-matching note id: no rows.
         let none = store
-            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(vec![phantom_tip]))
+            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNoteIds(vec![phantom_tip]))
             .await?;
-        assert!(none.is_empty(), "non-matching nullifier should return no rows");
+        assert!(none.is_empty(), "non-matching note id should return no rows");
 
-        // Matching nullifier: returns the row.
+        // Matching note id: returns the row.
         let one = store
-            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(vec![real_tip]))
+            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNoteIds(vec![real_tip]))
             .await?;
-        assert_eq!(one.len(), 1, "matching nullifier should return its lineage");
-        assert_eq!(one[0].current_tip_nullifier, real_tip);
+        assert_eq!(one.len(), 1, "matching note id should return its lineage");
+        assert_eq!(one[0].current_tip_note_id, real_tip);
 
-        // Mixed set (real + phantom): returns just the real one. Exercises
-        // the multi-element IN-clause path.
+        // Mixed set (real + phantom): returns just the real one.
         let mixed = store
-            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(vec![
+            .list_pswap_lineages(PswapLineageFilter::ActiveByTipNoteIds(vec![
                 phantom_tip,
                 real_tip,
                 phantom_tip,
             ]))
             .await?;
         assert_eq!(mixed.len(), 1, "mixed set should return only the matching lineage");
-        assert_eq!(mixed[0].current_tip_nullifier, real_tip);
+        assert_eq!(mixed[0].current_tip_note_id, real_tip);
 
         Ok(())
     }
@@ -1210,17 +1198,15 @@ mod tests {
             assert_eq!(lineage.remaining_offered.amount(), new_offered);
             assert_eq!(lineage.remaining_requested.amount(), new_requested);
 
-            // 6. Lineage should now be visible by the new tip's nullifier
-            //    (proving the remainder's nullifier is correctly tracked for
-            //    round N+1 detection — see layer-2 fix commit d6995a76).
+            // 6. Lineage should now be visible by the new tip's note id
+            //    (proving the remainder is correctly tracked for round N+1
+            //    detection — see layer-2 fix commit d6995a76).
             let by_tip = store
-                .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(vec![
-                    remainder.nullifier(),
+                .list_pswap_lineages(PswapLineageFilter::ActiveByTipNoteIds(vec![
+                    remainder.id(),
                 ]))
                 .await?;
-            // (remainder is a `Note`, which DOES have nullifier() directly — no
-            // need for the Note::from(...) dance we did for PswapNote earlier.)
-            assert_eq!(by_tip.len(), 1, "lineage findable by new tip nullifier");
+            assert_eq!(by_tip.len(), 1, "lineage findable by new tip note id");
 
             Ok(())
         }
@@ -1340,7 +1326,7 @@ mod tests {
         /// **Security**: a PSWAP-attachment note belonging to an order we
         /// DON'T track must not affect our store. Defense-in-depth: even
         /// though the SQL filter in `discover_pswap_rounds`
-        /// (`ActiveByTipNullifiers`) doesn't return it, the `apply()`
+        /// (`ActiveByTipNoteIds`) doesn't return it, the `apply()`
         /// active-lineage filter is the second line of defense — both
         /// must agree on "not ours, skip".
         #[tokio::test]
@@ -1425,7 +1411,6 @@ mod tests {
             ).unwrap();
             record.current_depth = 1;
             record.current_tip_note_id = already_at.id();
-            record.current_tip_nullifier = already_at.nullifier();
             let offered_faucet = pswap.offered_asset().faucet_id();
             let requested_faucet = pswap.storage().requested_asset().faucet_id();
             record.remaining_offered =
@@ -1462,7 +1447,7 @@ mod tests {
         /// **Security**: a terminal-state lineage (FullyFilled or Reclaimed)
         /// must NOT be advanced even if its old tip nullifier shows up in
         /// the window again (e.g. via re-org or replayed sync data).
-        /// Two defenses: `ActiveByTipNullifiers` SQL filter excludes
+        /// Two defenses: `ActiveByTipNoteIds` SQL filter excludes
         /// non-Active rows; the apply() active-lineage filter is the second
         /// line of defense.
         #[tokio::test]

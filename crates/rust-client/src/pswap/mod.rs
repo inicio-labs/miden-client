@@ -111,7 +111,6 @@ fn build_initial_lineage_record(
     PswapLineageRecord {
         original_pswap: pswap.clone(),
         current_tip_note_id: note.id(),
-        current_tip_nullifier: note.nullifier(),
         current_depth: 0,
         remaining_offered: pswap.offered_asset().clone(),
         remaining_requested: pswap.storage().requested_asset().clone(),

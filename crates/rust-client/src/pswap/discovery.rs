@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{Note, Nullifier};
+use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::{PswapNote, PswapNoteAttachment};
 use tracing::error;
 
@@ -45,17 +45,17 @@ pub async fn discover_pswap_rounds(
     state_sync_update: &StateSyncUpdate,
     chain_note_updates: &[PswapChainNoteUpdate],
 ) -> Result<Vec<PswapLineageRoundUpdate>, ClientError> {
-    let consumed_nullifiers: BTreeSet<Nullifier> =
-        state_sync_update.note_updates.consumed_nullifiers().collect();
+    let consumed_note_ids: BTreeSet<NoteId> =
+        state_sync_update.note_updates.consumed_note_ids().collect();
 
-    if consumed_nullifiers.is_empty() && chain_note_updates.is_empty() {
+    if consumed_note_ids.is_empty() && chain_note_updates.is_empty() {
         return Ok(Vec::new());
     }
 
     // Load only lineages whose tip is in this sync window.
     let active_lineages = store
-        .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(
-            consumed_nullifiers.iter().copied().collect(),
+        .list_pswap_lineages(PswapLineageFilter::ActiveByTipNoteIds(
+            consumed_note_ids.iter().copied().collect(),
         ))
         .await?;
     if active_lineages.is_empty() {
@@ -80,7 +80,7 @@ pub async fn discover_pswap_rounds(
         let mut lineage = lineage_record;
 
         // Same-block multi-fill: re-check the new tip after each in-memory advance.
-        while consumed_nullifiers.contains(&lineage.current_tip_nullifier) {
+        while consumed_note_ids.contains(&lineage.current_tip_note_id) {
             let round_depth = lineage.current_depth + 1;
             let notes = notes_by_order_depth
                 .get(&(lineage.order_id_key(), round_depth))
@@ -143,7 +143,6 @@ fn build_round_update(
                 remaining_requested: zero_requested,
                 state: PswapLineageState::Reclaimed,
                 tip_note_id: None,
-                tip_nullifier: None,
                 at_block: at_block_num,
                 payback: None,
                 payback_inclusion_proof: None,
@@ -168,7 +167,6 @@ fn build_round_update(
                 remaining_requested: zero_requested,
                 state: PswapLineageState::FullyFilled,
                 tip_note_id: None,
-                tip_nullifier: None,
                 at_block: at_block_num,
                 payback: Some(payback),
                 payback_inclusion_proof: Some(payback_note_update.inclusion_proof.clone()),
@@ -213,7 +211,6 @@ fn build_round_update(
                 )
                 .map_err(PswapLineageError::Reconstruction)?;
             // Phase 1: no id-match verification (see `reconstruct_payback`).
-            let tip_nullifier = remainder_note.nullifier();
 
             Ok(Some(PswapLineageRoundUpdate {
                 order_id: lineage.order_id(),
@@ -225,7 +222,6 @@ fn build_round_update(
                 remaining_requested,
                 state: PswapLineageState::Active,
                 tip_note_id: Some(remainder_note_update.note_id),
-                tip_nullifier: Some(tip_nullifier),
                 at_block: at_block_num,
                 payback: Some(payback_note),
                 payback_inclusion_proof: Some(payback_note_update.inclusion_proof.clone()),
@@ -269,11 +265,8 @@ impl PswapLineageRecord {
         self.remaining_requested = update.remaining_requested;
         self.state = update.state;
         self.updated_at_block = update.at_block;
-        if let (Some(note_id), Some(nullifier)) =
-            (update.tip_note_id, update.tip_nullifier)
-        {
+        if let Some(note_id) = update.tip_note_id {
             self.current_tip_note_id = note_id;
-            self.current_tip_nullifier = nullifier;
         }
         self
     }
@@ -336,7 +329,6 @@ mod tests {
         PswapLineageRecord {
             original_pswap: pswap,
             current_tip_note_id: note.id(),
-            current_tip_nullifier: note.nullifier(),
             current_depth: 0,
             remaining_offered: FungibleAsset::new(offered_faucet, offered)
                 .expect("test value fits in FungibleAsset"),
@@ -464,7 +456,6 @@ mod tests {
         assert_eq!(update.remaining_offered.amount(), AssetAmount::ZERO);
         assert_eq!(update.remaining_requested.amount(), AssetAmount::ZERO);
         assert_eq!(update.tip_note_id, None);
-        assert_eq!(update.tip_nullifier, None);
         assert!(update.remainder.is_none());
     }
 

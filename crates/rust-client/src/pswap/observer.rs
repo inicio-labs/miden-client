@@ -128,7 +128,7 @@ impl NoteObserver for PswapChainObserver {
         // Fast path: no observed PSWAP notes AND no tracked-note consumptions
         // — nothing for the correlator to do.
         if pending.is_empty()
-            && sync_update.note_updates.consumed_nullifiers().next().is_none()
+            && sync_update.note_updates.consumed_note_ids().next().is_none()
         {
             return Ok(());
         }

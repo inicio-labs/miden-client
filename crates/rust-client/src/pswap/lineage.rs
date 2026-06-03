@@ -10,7 +10,7 @@ use miden_protocol::Word;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{Note, NoteId, NoteInclusionProof, NoteTag, NoteType, Nullifier};
+use miden_protocol::note::{Note, NoteId, NoteInclusionProof, NoteTag, NoteType};
 use miden_standards::note::PswapNote;
 
 use super::errors::PswapLineageError;
@@ -63,8 +63,6 @@ pub struct PswapLineageRecord {
     /// Current tip's note id. Equals `original_pswap.id()` at depth 0;
     /// otherwise a remainder we didn't originate.
     pub current_tip_note_id: NoteId,
-    /// Current tip's nullifier. Indexed for fast lookup during sync.
-    pub current_tip_nullifier: Nullifier,
     /// 0 for the original tip; +1 per round. Matches `PswapNoteAttachment::depth()`.
     pub current_depth: u32,
     /// Offered-asset balance still unfilled (same faucet as
@@ -158,7 +156,6 @@ pub struct PswapLineageRoundUpdate {
     pub state: PswapLineageState,
     /// New tip (remainder). `None` for terminal rounds.
     pub tip_note_id: Option<NoteId>,
-    pub tip_nullifier: Option<Nullifier>,
     /// Block the previous tip was consumed in.
     pub at_block: BlockNumber,
     /// Reconstructed payback; inserted into `input_notes` by the store.
@@ -185,10 +182,10 @@ pub enum PswapLineageFilter {
     Active,
     ByCreator(AccountId),
     ByOrderId(Felt),
-    /// Active rows whose `current_tip_nullifier` is in the given set.
+    /// Active rows whose `current_tip_note_id` is in the given set.
     /// Empty input returns no rows. Used by `discover_pswap_rounds` to
     /// load only the lineages whose tip was consumed this sync.
-    ActiveByTipNullifiers(Vec<Nullifier>),
+    ActiveByTipNoteIds(Vec<NoteId>),
 }
 
 // SERDE HELPERS
@@ -202,7 +199,6 @@ pub enum PswapLineageFilter {
 pub fn build_record_from_columns(
     original_pswap: PswapNote,
     current_tip_note_id: NoteId,
-    current_tip_nullifier: Nullifier,
     current_depth: u32,
     remaining_offered: u64,
     remaining_requested: u64,
@@ -230,7 +226,6 @@ pub fn build_record_from_columns(
     Ok(PswapLineageRecord {
         original_pswap,
         current_tip_note_id,
-        current_tip_nullifier,
         current_depth,
         remaining_offered,
         remaining_requested,
@@ -349,12 +344,10 @@ mod tests {
         let pswap =
             build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
         let initial_note_id = miden_protocol::note::Note::from(pswap.clone()).id();
-        let nullifier = miden_protocol::note::Note::from(pswap.clone()).nullifier();
 
         let record = build_record_from_columns(
             pswap,
             initial_note_id,
-            nullifier,
             0,
             100,
             50,
@@ -380,7 +373,6 @@ mod tests {
         let record = build_record_from_columns(
             pswap,
             note.id(),
-            note.nullifier(),
             3,
             70,
             35,
@@ -404,7 +396,6 @@ mod tests {
         match build_record_from_columns(
             pswap,
             note.id(),
-            note.nullifier(),
             0,
             100,
             50,
@@ -441,7 +432,6 @@ mod tests {
         let record = PswapLineageRecord {
             original_pswap: pswap,
             current_tip_note_id: note.id(),
-            current_tip_nullifier: note.nullifier(),
             current_depth: 0,
             remaining_offered,
             remaining_requested,

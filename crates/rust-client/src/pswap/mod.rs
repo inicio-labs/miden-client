@@ -124,8 +124,6 @@ fn build_initial_lineage_record(
             pswap.storage().requested_asset_amount(),
         )
         .expect("PSWAP storage's requested_asset_amount is bounded by FungibleAsset's invariant"),
-        last_consumer_account_id: None,
-        last_payout_amount: None,
         state: PswapLineageState::Active,
         created_at_block: submission_height,
         updated_at_block: submission_height,
@@ -217,11 +215,12 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             return Err(PswapLineageError::CreatorNotLocal(creator).into());
         }
 
+        // Look up the current tip note. At depth 0 it's in `output_notes`
+        // (we minted it). At depth > 0 it's in `input_notes` — inserted by
+        // `apply_pswap_round` when the round landed (see layer-2 commit
+        // `d6995a76`). Either way, no reconstruction needed: the note
+        // we wrote IS the note we read.
         let tip_note: Note = if lineage.current_depth == 0 {
-            // The original PSWAP is in the local store as an output
-            // note we minted ourselves. The exact recipient is needed
-            // for `build_pswap_cancel` to recompute the script root;
-            // fetching it from the store is canonical.
             let record = self
                 .store
                 .get_output_notes(NoteFilter::Unique(lineage.current_tip_note_id))
@@ -231,46 +230,14 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
                 .ok_or(PswapLineageError::TipMissing)?;
             record.try_into().map_err(ClientError::NoteRecordConversionError)?
         } else {
-            // The current tip is a remainder this client never
-            // originated. Reconstruct it byte-identically from the
-            // stored `last_consumer` / `last_payout` / `remaining_*`.
-            // `lineage::build_record_from_columns` validates these
-            // fields' consistency at deserialization time
-            // (last_consumer + last_payout must both be present iff
-            // current_depth > 0), so the unwraps below are infallible
-            // by row invariant — but we propagate
-            // `InconsistentRow` defensively.
-            let last_consumer = lineage.last_consumer_account_id.ok_or(
-                PswapLineageError::InconsistentRow(alloc::string::String::from(
-                    "current_depth > 0 but last_consumer_account_id is NULL",
-                )),
-            )?;
-            let last_payout = lineage.last_payout_amount.ok_or(
-                PswapLineageError::InconsistentRow(alloc::string::String::from(
-                    "current_depth > 0 but last_payout_amount is NULL",
-                )),
-            )?;
-
-            // The protocol's `remainder_note` builder takes a typed
-            // `PswapNoteAttachment { amount, order_id, depth }` rather
-            // than loose `(depth, payout)` args; construct it from the
-            // lineage's persisted round-N state. `last_payout` /
-            // `remaining_*` are already `AssetAmount` after the
-            // store-side refactor, so no per-call conversion needed.
-            let attachment = miden_standards::note::PswapNoteAttachment::new(
-                last_payout,
-                lineage.order_id(),
-                lineage.current_depth,
-            );
-            lineage
-                .original_pswap
-                .remainder_note(
-                    last_consumer,
-                    &attachment,
-                    lineage.remaining_offered,
-                    lineage.remaining_requested,
-                )
-                .map_err(PswapLineageError::Reconstruction)?
+            let record = self
+                .store
+                .get_input_notes(NoteFilter::Unique(lineage.current_tip_note_id))
+                .await?
+                .into_iter()
+                .next()
+                .ok_or(PswapLineageError::TipMissing)?;
+            record.try_into().map_err(ClientError::NoteRecordConversionError)?
         };
 
         TransactionRequestBuilder::new()

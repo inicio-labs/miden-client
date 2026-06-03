@@ -291,8 +291,6 @@ impl PswapLineageRecord {
         self.current_depth = update.round_depth;
         self.remaining_offered = update.remaining_offered;
         self.remaining_requested = update.remaining_requested;
-        self.last_consumer_account_id = Some(update.consumer_account_id);
-        self.last_payout_amount = Some(update.payout_amount);
         self.state = update.state;
         self.updated_at_block = update.at_block;
         if let (Some(note_id), Some(nullifier)) =
@@ -370,8 +368,6 @@ mod tests {
             remaining_offered: AssetAmount::new(offered).expect("test value fits in AssetAmount"),
             remaining_requested: AssetAmount::new(requested)
                 .expect("test value fits in AssetAmount"),
-            last_consumer_account_id: None,
-            last_payout_amount: None,
             state: PswapLineageState::Active,
             created_at_block: BlockNumber::from(0),
             updated_at_block: BlockNumber::from(0),

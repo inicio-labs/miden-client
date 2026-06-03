@@ -6,6 +6,7 @@
 use std::string::String;
 use std::vec::Vec;
 
+#[cfg(test)]
 use miden_client::account::AccountId;
 use miden_client::note::{BlockNumber, Note, NoteId, Nullifier, PswapNote};
 use miden_client::pswap::{
@@ -199,8 +200,7 @@ fn remove_pswap_asset_pair_tag_tx(
 
 const SELECT_LINEAGE_COLUMNS_PREFIX: &str = "\
 SELECT order_id, original_pswap, current_tip_note_id, current_tip_nullifier, \
-       current_depth, remaining_offered, remaining_requested, \
-       last_consumer_account_id, last_payout_amount, state, \
+       current_depth, remaining_offered, remaining_requested, state, \
        created_at_block, updated_at_block \
 FROM pswap_lineages";
 
@@ -263,11 +263,9 @@ fn record_from_row(row: &Row<'_>) -> Result<PswapLineageRecord, StoreError> {
     let current_depth: u32 = row.get(4).into_store_error()?;
     let remaining_offered: u64 = row.get(5).into_store_error()?;
     let remaining_requested: u64 = row.get(6).into_store_error()?;
-    let last_consumer_bytes: Option<Vec<u8>> = row.get(7).into_store_error()?;
-    let last_payout_amount: Option<u64> = row.get(8).into_store_error()?;
-    let state_byte: u8 = row.get(9).into_store_error()?;
-    let created_at_block: u32 = row.get(10).into_store_error()?;
-    let updated_at_block: u32 = row.get(11).into_store_error()?;
+    let state_byte: u8 = row.get(7).into_store_error()?;
+    let created_at_block: u32 = row.get(8).into_store_error()?;
+    let updated_at_block: u32 = row.get(9).into_store_error()?;
 
     // `PswapNote` does not impl Serializable directly; persist as `Note`
     // and round-trip via the existing conversion.
@@ -281,11 +279,6 @@ fn record_from_row(row: &Row<'_>) -> Result<PswapLineageRecord, StoreError> {
     let current_tip_nullifier = Nullifier::from_hex(&nullifier_text)
         .map_err(|err| StoreError::DataDeserializationError(deser_err(err.to_string())))?;
 
-    let last_consumer_account_id = last_consumer_bytes
-        .map(|bytes| AccountId::read_from_bytes(&bytes))
-        .transpose()
-        .map_err(StoreError::DataDeserializationError)?;
-
     build_record_from_columns(
         original_pswap,
         current_tip_note_id,
@@ -293,8 +286,6 @@ fn record_from_row(row: &Row<'_>) -> Result<PswapLineageRecord, StoreError> {
         current_depth,
         remaining_offered,
         remaining_requested,
-        last_consumer_account_id,
-        last_payout_amount,
         state_byte,
         BlockNumber::from(created_at_block),
         BlockNumber::from(updated_at_block),
@@ -313,13 +304,11 @@ fn upsert_pswap_lineage_tx(
     const SQL: &str = "\
 INSERT OR REPLACE INTO pswap_lineages \
 (order_id, original_pswap, current_tip_note_id, current_tip_nullifier, \
- current_depth, remaining_offered, remaining_requested, \
- last_consumer_account_id, last_payout_amount, state, \
+ current_depth, remaining_offered, remaining_requested, state, \
  created_at_block, updated_at_block) \
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     let original_pswap_bytes = Note::from(record.original_pswap.clone()).to_bytes();
-    let last_consumer_bytes = record.last_consumer_account_id.map(|id| id.to_bytes());
 
     tx.prepare_cached(SQL)
         .into_store_error()?
@@ -331,8 +320,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
             record.current_depth,
             u64::from(record.remaining_offered),
             u64::from(record.remaining_requested),
-            last_consumer_bytes,
-            record.last_payout_amount.map(u64::from),
             record.state.as_u8(),
             record.created_at_block.as_u32(),
             record.updated_at_block.as_u32(),
@@ -382,7 +369,6 @@ fn update_lineage_tip_tx(
     }
 
     let updated_block = update.at_block.as_u32();
-    let last_consumer_bytes = update.consumer_account_id.to_bytes();
 
     let rows_changed = match (update.tip_note_id, update.tip_nullifier) {
         (Some(note_id), Some(nullifier)) => {
@@ -391,7 +377,6 @@ fn update_lineage_tip_tx(
 UPDATE pswap_lineages SET \
  current_tip_note_id = ?, current_tip_nullifier = ?, \
  current_depth = ?, remaining_offered = ?, remaining_requested = ?, \
- last_consumer_account_id = ?, last_payout_amount = ?, \
  state = ?, updated_at_block = ? \
 WHERE order_id = ?";
             tx.prepare_cached(SQL)
@@ -402,8 +387,6 @@ WHERE order_id = ?";
                     update.round_depth,
                     u64::from(update.remaining_offered),
                     u64::from(update.remaining_requested),
-                    last_consumer_bytes,
-                    u64::from(update.payout_amount),
                     update.state.as_u8(),
                     updated_block,
                     order_id_bytes,
@@ -415,7 +398,6 @@ WHERE order_id = ?";
             const SQL: &str = "\
 UPDATE pswap_lineages SET \
  remaining_offered = ?, remaining_requested = ?, \
- last_consumer_account_id = ?, last_payout_amount = ?, \
  state = ?, updated_at_block = ? \
 WHERE order_id = ?";
             tx.prepare_cached(SQL)
@@ -423,8 +405,6 @@ WHERE order_id = ?";
                 .execute(params![
                     u64::from(update.remaining_offered),
                     u64::from(update.remaining_requested),
-                    last_consumer_bytes,
-                    u64::from(update.payout_amount),
                     update.state.as_u8(),
                     updated_block,
                     order_id_bytes,
@@ -585,8 +565,6 @@ mod tests {
                 pswap.storage().requested_asset_amount(),
             )
             .expect("test PSWAP's requested_asset_amount fits in AssetAmount"),
-            last_consumer_account_id: None,
-            last_payout_amount: None,
             state: PswapLineageState::Active,
             created_at_block: BlockNumber::from(7),
             updated_at_block: BlockNumber::from(7),
@@ -621,8 +599,6 @@ mod tests {
         assert_eq!(fetched.current_depth, record.current_depth);
         assert_eq!(fetched.remaining_offered, record.remaining_offered);
         assert_eq!(fetched.remaining_requested, record.remaining_requested);
-        assert_eq!(fetched.last_consumer_account_id, record.last_consumer_account_id);
-        assert_eq!(fetched.last_payout_amount, record.last_payout_amount);
         assert_eq!(fetched.state, record.state);
         assert_eq!(fetched.creator_account_id(), record.creator_account_id());
         assert_eq!(fetched.offered_asset().amount(), record.offered_asset().amount());
@@ -1390,8 +1366,6 @@ mod tests {
             record.current_tip_nullifier = already_at.nullifier();
             record.remaining_offered = AssetAmount::new(60).unwrap();
             record.remaining_requested = AssetAmount::new(30).unwrap();
-            record.last_consumer_account_id = Some(bob());
-            record.last_payout_amount = Some(AssetAmount::new(40).unwrap());
             store.upsert_pswap_lineage(&record).await?;
 
             // Sync replays an old depth-1 payback (stale).

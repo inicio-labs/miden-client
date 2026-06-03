@@ -3,7 +3,6 @@
 //! See module-level docs on [`crate::pswap`].
 
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use miden_protocol::Felt;
@@ -96,16 +95,6 @@ pub struct PswapLineageRecord {
     /// the per-round `fill_amount`. See [`Self::remaining_offered`] for
     /// notes on the `AssetAmount` boundary.
     pub remaining_requested: AssetAmount,
-
-    /// Account that consumed the previous tip and emitted the current one.
-    /// `None` iff `current_depth == 0` (the original tip was not consumed
-    /// by anyone yet). Required input to [`PswapNote::remainder_note`] when
-    /// the creator wants to reclaim the current tip.
-    pub last_consumer_account_id: Option<AccountId>,
-    /// Offered-asset units paid out in the round that produced the current
-    /// tip. `None` iff `current_depth == 0`. Required input to
-    /// [`PswapNote::remainder_note`].
-    pub last_payout_amount: Option<AssetAmount>,
 
     /// Current lifecycle state — see [`PswapLineageState`].
     pub state: PswapLineageState,
@@ -284,7 +273,6 @@ pub enum PswapLineageFilter {
 ///
 /// Kept in the rust-client crate (rather than the SQLite store crate) so
 /// alternative backends can reuse the parsing logic.
-#[cfg_attr(any(test, feature = "testing"), allow(clippy::too_many_arguments))]
 pub fn build_record_from_columns(
     original_pswap: PswapNote,
     current_tip_note_id: NoteId,
@@ -292,28 +280,12 @@ pub fn build_record_from_columns(
     current_depth: u32,
     remaining_offered: u64,
     remaining_requested: u64,
-    last_consumer_account_id: Option<AccountId>,
-    last_payout_amount: Option<u64>,
     state_byte: u8,
     created_at_block: BlockNumber,
     updated_at_block: BlockNumber,
 ) -> Result<PswapLineageRecord, PswapLineageError> {
-    // Sanity: `last_*` columns must be present iff depth > 0. Persisting
-    // them inconsistently would silently break reclaim reconstruction.
-    let depth_is_zero = current_depth == 0;
-    let last_consumer_present = last_consumer_account_id.is_some();
-    let last_payout_present = last_payout_amount.is_some();
-    if depth_is_zero != !last_consumer_present || depth_is_zero != !last_payout_present {
-        return Err(PswapLineageError::InconsistentRow(String::from(
-            "last_consumer_account_id and last_payout_amount must both be set iff current_depth > 0",
-        )));
-    }
-
-    // SQLite stores INTEGER bytes; validate the `<= AssetAmount::MAX`
-    // invariant at this single boundary instead of fanning out
-    // unwraps across every reader. A row exceeding MAX would either be
-    // corruption or a legacy row from before the type tightening — both
-    // cases warrant an InconsistentRow error rather than a silent pass.
+    // Validate the `<= AssetAmount::MAX` invariant at this single boundary
+    // — a row exceeding MAX is corruption (or legacy from before typing).
     let to_amount = |raw: u64, field: &'static str| -> Result<AssetAmount, PswapLineageError> {
         AssetAmount::new(raw).map_err(|err| {
             PswapLineageError::InconsistentRow(format!(
@@ -323,10 +295,6 @@ pub fn build_record_from_columns(
     };
     let remaining_offered = to_amount(remaining_offered, "remaining_offered")?;
     let remaining_requested = to_amount(remaining_requested, "remaining_requested")?;
-    let last_payout_amount = match last_payout_amount {
-        Some(raw) => Some(to_amount(raw, "last_payout_amount")?),
-        None => None,
-    };
 
     Ok(PswapLineageRecord {
         original_pswap,
@@ -335,8 +303,6 @@ pub fn build_record_from_columns(
         current_depth,
         remaining_offered,
         remaining_requested,
-        last_consumer_account_id,
-        last_payout_amount,
         state: PswapLineageState::try_from_u8(state_byte)?,
         created_at_block,
         updated_at_block,
@@ -444,8 +410,7 @@ mod tests {
         }
     }
 
-    /// Happy path for `build_record_from_columns` at depth 0 — both
-    /// `last_*` columns are `None`, every field carries through.
+    /// Happy path for `build_record_from_columns` at depth 0.
     #[test]
     fn build_record_from_columns_accepts_valid_depth_zero_row() {
         let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
@@ -461,8 +426,6 @@ mod tests {
             0,
             100,
             50,
-            None,
-            None,
             PswapLineageState::Active.as_u8(),
             BlockNumber::from(7),
             BlockNumber::from(7),
@@ -472,17 +435,13 @@ mod tests {
         assert_eq!(record.current_depth, 0);
         assert_eq!(record.remaining_offered, AssetAmount::new(100).unwrap());
         assert_eq!(record.remaining_requested, AssetAmount::new(50).unwrap());
-        assert!(record.last_consumer_account_id.is_none());
-        assert!(record.last_payout_amount.is_none());
         assert_eq!(record.state, PswapLineageState::Active);
     }
 
-    /// Happy path at `current_depth > 0` — both `last_*` columns MUST
-    /// be populated.
+    /// Happy path at `current_depth > 0`.
     #[test]
     fn build_record_from_columns_accepts_valid_advanced_row() {
         let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let consumer = sender; // any non-creator account; reuse for brevity
         let pswap =
             build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
         let note = miden_protocol::note::Note::from(pswap.clone());
@@ -493,76 +452,17 @@ mod tests {
             3,
             70,
             35,
-            Some(consumer),
-            Some(20),
             PswapLineageState::Active.as_u8(),
             BlockNumber::from(7),
             BlockNumber::from(12),
         )
         .unwrap();
 
-        assert_eq!(record.last_consumer_account_id, Some(consumer));
-        assert_eq!(record.last_payout_amount, Some(AssetAmount::new(20).unwrap()));
+        assert_eq!(record.current_depth, 3);
+        assert_eq!(record.remaining_offered, AssetAmount::new(70).unwrap());
     }
 
-    /// `current_depth == 0` with a populated `last_consumer` is the
-    /// classic inconsistency that breaks `remainder_note` reconstruction
-    /// (it implies a foreign account consumed the original PSWAP but we
-    /// somehow have round-0 state). Must surface as `InconsistentRow`.
-    #[test]
-    fn build_record_from_columns_rejects_depth_zero_with_last_consumer() {
-        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let pswap =
-            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
-        let note = miden_protocol::note::Note::from(pswap.clone());
-        match build_record_from_columns(
-            pswap,
-            note.id(),
-            note.nullifier(),
-            0,
-            100,
-            50,
-            Some(sender), // ← inconsistent: depth 0 but last_consumer set
-            None,
-            PswapLineageState::Active.as_u8(),
-            BlockNumber::from(0),
-            BlockNumber::from(0),
-        ) {
-            Err(PswapLineageError::InconsistentRow(_)) => {},
-            other => panic!("expected InconsistentRow, got {other:?}"),
-        }
-    }
-
-    /// `current_depth > 0` with `last_payout_amount` NULL breaks the
-    /// remainder reconstruction path used by reclaim. Must surface as
-    /// `InconsistentRow`.
-    #[test]
-    fn build_record_from_columns_rejects_advanced_depth_without_last_payout() {
-        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let pswap =
-            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
-        let note = miden_protocol::note::Note::from(pswap.clone());
-        match build_record_from_columns(
-            pswap,
-            note.id(),
-            note.nullifier(),
-            1,
-            50,
-            25,
-            Some(sender),
-            None, // ← inconsistent: depth > 0 but last_payout NULL
-            PswapLineageState::Active.as_u8(),
-            BlockNumber::from(0),
-            BlockNumber::from(0),
-        ) {
-            Err(PswapLineageError::InconsistentRow(_)) => {},
-            other => panic!("expected InconsistentRow, got {other:?}"),
-        }
-    }
-
-    /// Unknown state discriminant in the row bubbles up as
-    /// `UnknownState`. Reused: the same validation also covers schema-
-    /// drift defense for the `state` column.
+    /// Unknown state discriminant in the row bubbles up as `UnknownState`.
     #[test]
     fn build_record_from_columns_rejects_unknown_state() {
         let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
@@ -576,8 +476,6 @@ mod tests {
             0,
             100,
             50,
-            None,
-            None,
             42,
             BlockNumber::from(0),
             BlockNumber::from(0),
@@ -613,8 +511,6 @@ mod tests {
             current_depth: 0,
             remaining_offered: AssetAmount::new(100).unwrap(),
             remaining_requested: AssetAmount::new(50).unwrap(),
-            last_consumer_account_id: None,
-            last_payout_amount: None,
             state: PswapLineageState::Active,
             created_at_block: BlockNumber::from(0),
             updated_at_block: BlockNumber::from(0),

@@ -21,26 +21,53 @@ mod types;
 pub use errors::PswapLineageError;
 pub use lineage::{PswapLineageFilter, PswapLineageRecord, PswapLineageRoundUpdate, PswapLineageState};
 pub use observer::{PswapChainNoteUpdate, PswapChainObserver};
+// `PswapTransactionObserver` is defined inline below in this file.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
 
+use async_trait::async_trait;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::Note;
 use miden_standards::note::PswapNote;
 use miden_tx::auth::TransactionAuthenticator;
 
 use crate::ClientError;
+use crate::store::Store;
 use crate::sync::{NoteTagRecord, NoteTagSource};
-use crate::transaction::TransactionResult;
-use crate::{Client, transaction::notes_from_output};
+use crate::transaction::{TransactionObserver, TransactionResult, notes_from_output};
+use crate::Client;
 
-impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
-    /// Inserts a lineage row + asset-pair tag subscription for every PSWAP
-    /// this transaction just created (any output where `PswapNote::try_from`
-    /// succeeds AND `parent_depth == 0`). Idempotent. Tracks regardless of
-    /// `creator_account_id` (reclaim surfaces `CreatorNotLocal` later if
-    /// the creator isn't a local account).
-    pub(crate) async fn record_created_pswap_lineages(
+// PSWAP TRANSACTION OBSERVER
+// ================================================================================================
+
+/// [`TransactionObserver`] that registers a [`PswapLineageRecord`] +
+/// asset-pair tag subscription for every PSWAP this wallet just created
+/// (any output where `PswapNote::try_from` succeeds AND `parent_depth == 0`).
+///
+/// Tracks regardless of the PSWAP's `creator_account_id` — service-style
+/// wallets that submit PSWAPs on behalf of remote clients get chain
+/// visibility. Reclaim surfaces `CreatorNotLocal` later if applicable.
+/// Idempotent on the store side (upsert by `order_id` + `(tag, source)`
+/// insert).
+pub struct PswapTransactionObserver {
+    store: Arc<dyn Store>,
+}
+
+impl PswapTransactionObserver {
+    pub fn new(store: Arc<dyn Store>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait(?Send)]
+impl TransactionObserver for PswapTransactionObserver {
+    fn name(&self) -> &'static str {
+        "PswapTransactionObserver"
+    }
+
+    async fn observe(
         &self,
         tx_result: &TransactionResult,
         submission_height: BlockNumber,

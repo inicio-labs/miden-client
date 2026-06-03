@@ -1,5 +1,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use alloc::vec;
 
 use miden_protocol::assembly::{DefaultSourceManager, SourceManagerSync};
 use miden_protocol::block::BlockNumber;
@@ -518,6 +520,12 @@ where
             self.note_transport_api = Some(Arc::new(transport) as Arc<dyn NoteTransportClient>);
         }
 
+        // Built-in transaction observers fired by `apply_transaction`.
+        // PSWAP chain tracking is always-on; additional observers can be
+        // attached via `Client::with_transaction_observer`.
+        let transaction_observers: Vec<Arc<dyn crate::transaction::TransactionObserver>> =
+            vec![Arc::new(crate::pswap::PswapTransactionObserver::new(store.clone()))];
+
         // Construct and return the Client
         Ok(Client {
             store,
@@ -541,6 +549,7 @@ where
             note_transport_api: self.note_transport_api.clone(),
             cache_partial_mmr_in_memory: self.cache_partial_mmr_in_memory,
             partial_mmr: None,
+            transaction_observers,
         })
     }
 }

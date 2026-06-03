@@ -335,6 +335,7 @@ pub mod testing {
 }
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::merkle::mmr::PartialMmr;
@@ -393,6 +394,12 @@ pub struct Client<AUTH> {
     /// Cached [`PartialMmr`] for the chain's MMR. Lazily built from the store and kept in sync
     /// across sync/prune operations. `None` forces a rebuild on next access.
     partial_mmr: Option<CachedPartialMmr>,
+    /// Side-effect-only observers fired by `Client::apply_transaction`
+    /// after the transaction's standard updates are persisted. Built-in
+    /// PSWAP tracking is registered by `ClientBuilder::build()`;
+    /// additional observers can be added via
+    /// [`Client::with_transaction_observer`].
+    transaction_observers: Vec<Arc<dyn transaction::TransactionObserver>>,
 }
 
 /// Cached [`PartialMmr`] with a two-part freshness fingerprint:
@@ -482,6 +489,17 @@ impl<AUTH> Client<AUTH> {
     /// file path).
     pub fn store_identifier(&self) -> &str {
         self.store.identifier()
+    }
+
+    /// Registers an additional [`TransactionObserver`] that fires on every
+    /// `Client::apply_transaction` after the standard updates land.
+    /// Multiple observers can be registered; each is invoked independently
+    /// and per-observer failures are logged, never propagated.
+    pub fn with_transaction_observer(
+        &mut self,
+        observer: Arc<dyn transaction::TransactionObserver>,
+    ) {
+        self.transaction_observers.push(observer);
     }
 
     // TEST HELPERS

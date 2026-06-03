@@ -139,6 +139,9 @@ pub use request::{
     TransactionScriptTemplate,
 };
 
+mod observer;
+pub use observer::TransactionObserver;
+
 mod result;
 // RE-EXPORTS
 // ================================================================================================
@@ -484,9 +487,22 @@ where
 
         self.apply_transaction_update(tx_update).await?;
 
-        // Record any new PSWAP orders this transaction created (after store
-        // apply, so lineage rows only exist for landed transactions).
-        self.record_created_pswap_lineages(tx_result, submission_height).await?;
+        // Fire registered transaction observers (PSWAP chain tracking +
+        // anything else attached via `with_transaction_observer`).
+        // Per-observer failures are logged; one bad observer cannot
+        // abort the rest.
+        for observer in &self.transaction_observers {
+            if let Err(err) =
+                <dyn TransactionObserver>::observe(observer.as_ref(), tx_result, submission_height)
+                    .await
+            {
+                tracing::warn!(
+                    observer = observer.name(),
+                    error = ?err,
+                    "TransactionObserver::observe failed; continuing with remaining observers",
+                );
+            }
+        }
 
         Ok(())
     }

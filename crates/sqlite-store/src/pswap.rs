@@ -1029,6 +1029,54 @@ mod tests {
                 .expect("zero index is well below per-block notes ceiling")
         }
 
+        // ----- Convenience constructors used across scenarios. -----
+
+        /// Builds a `CommittedNote` (the per-note input observer sees).
+        fn commit_note(
+            note: &Note,
+            inclusion_proof: &NoteInclusionProof,
+        ) -> miden_client::rpc::domain::note::CommittedNote {
+            miden_client::rpc::domain::note::CommittedNote::new(
+                note.id(),
+                *note.metadata(),
+                inclusion_proof.clone(),
+            )
+        }
+
+        /// Builds a `FetchedNote::Private` with the real attachments — what a
+        /// well-behaved node would return from `GetNotesById` after #2214.
+        fn fetched_private(note: &Note, inclusion_proof: &NoteInclusionProof) -> FetchedNote {
+            FetchedNote::Private(
+                note.id(),
+                *note.metadata(),
+                inclusion_proof.clone(),
+                note.attachments().clone(),
+            )
+        }
+
+        /// Wraps a list of (note_id, FetchedNote) into the mock RPC.
+        fn build_mock_rpc(pairs: Vec<(NoteId, FetchedNote)>) -> Arc<dyn NodeRpcClient> {
+            Arc::new(PswapTestRpc {
+                notes_by_id: pairs.into_iter().collect(),
+            })
+        }
+
+        /// Builds a `StateSyncUpdate` whose only populated field is the
+        /// consumed-nullifier window. Sufficient for the PSWAP correlator path.
+        fn nullifier_window(entries: Vec<(miden_client::note::Nullifier, u32)>) -> StateSyncUpdate {
+            let mut update = StateSyncUpdate::default();
+            update.current_window_nullifier_blocks = entries
+                .into_iter()
+                .map(|(n, b)| (n, BlockNumber::from(b)))
+                .collect();
+            update
+        }
+
+        /// Bob's account id — used as the consumer in every scenario.
+        fn bob() -> AccountId {
+            AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap()
+        }
+
         /// End-to-end private-PSWAP partial-fill scenario.
         ///
         /// 1. Alice creates a private PSWAP P0 (offer 100 OA, request 50 RA).
@@ -1139,6 +1187,365 @@ mod tests {
             // need for the Note::from(...) dance we did for PswapNote earlier.)
             assert_eq!(by_tip.len(), 1, "lineage findable by new tip nullifier");
 
+            Ok(())
+        }
+
+        // =================================================================
+        // FUNCTIONAL SCENARIOS — full fill, reclaim, multi-round
+        // =================================================================
+
+        /// Full fill (depth 1) → lineage state becomes FullyFilled, no remainder.
+        ///
+        /// Bob exhausts Alice's offered side in one shot. Only the payback
+        /// is emitted; the PSWAP script has nothing left to remainder.
+        #[tokio::test]
+        async fn private_pswap_full_fill_marks_fully_filled() -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+            let pswap = build_private_test_pswap(100, 50);
+            store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
+            let p0_nullifier = Note::from(pswap.clone()).nullifier();
+
+            // Bob fills the entire 50 RA → 1 payback note (50 RA to Alice).
+            let fill_amount = AssetAmount::new(50).unwrap();
+            let payback_attach = PswapNoteAttachment::new(fill_amount, pswap.order_id(), 1);
+            let payback = pswap.payback_note(bob(), &payback_attach).unwrap();
+
+            let inclusion_proof = dummy_inclusion_proof(7);
+            let observer = PswapChainObserver::new(
+                store.clone(),
+                build_mock_rpc(vec![(payback.id(), fetched_private(&payback, &inclusion_proof))]),
+            );
+            observer.observe(&commit_note(&payback, &inclusion_proof)).await?;
+            observer.apply(&nullifier_window(vec![(p0_nullifier, 7)])).await?;
+
+            let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
+            assert_eq!(lineage.current_depth, 1);
+            assert_eq!(lineage.state, PswapLineageState::FullyFilled);
+            assert_eq!(lineage.remaining_offered, AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_requested, AssetAmount::ZERO);
+            Ok(())
+        }
+
+        /// Reclaim → lineage state becomes Reclaimed. Reclaim emits zero
+        /// notes; detection is nullifier-only (the creator's tx consumes the
+        /// current tip via the PSWAP script's cancel branch).
+        #[tokio::test]
+        async fn private_pswap_reclaim_marks_reclaimed() -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+            let pswap = build_private_test_pswap(100, 50);
+            store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
+            let p0_nullifier = Note::from(pswap.clone()).nullifier();
+
+            // No notes emitted by reclaim → empty mock RPC, no `observe()` calls.
+            let observer = PswapChainObserver::new(store.clone(), build_mock_rpc(vec![]));
+            observer.apply(&nullifier_window(vec![(p0_nullifier, 9)])).await?;
+
+            let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
+            assert_eq!(lineage.state, PswapLineageState::Reclaimed);
+            assert_eq!(lineage.remaining_offered, AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_requested, AssetAmount::ZERO);
+            Ok(())
+        }
+
+        /// Same-sync multi-fill — two consecutive rounds land in one sync
+        /// window. The inner `while let Some(at_block_num) = nullifier_to_block.get(...)`
+        /// loop in `discover_pswap_rounds` walks both via in-memory
+        /// advancement. Without this, round 2's tip nullifier would never
+        /// reappear in a future sync window → silently lost.
+        #[tokio::test]
+        async fn private_pswap_multi_round_same_sync_advances_twice() -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+            let pswap = build_private_test_pswap(100, 50);
+            store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
+            let p0_nullifier = Note::from(pswap.clone()).nullifier();
+
+            // Round 1: Bob partial-fill (fill=20, payout=40) → payback + remainder.
+            let p1_attach = PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1);
+            let payback_1 = pswap.payback_note(bob(), &p1_attach).unwrap();
+            let r1_attach = PswapNoteAttachment::new(AssetAmount::new(40).unwrap(), pswap.order_id(), 1);
+            let remainder_1 = pswap.remainder_note(
+                bob(), &r1_attach, AssetAmount::new(60).unwrap(), AssetAmount::new(30).unwrap(),
+            ).unwrap();
+
+            // Round 2: a different consumer fully fills the remainder (fill=30, payout=60).
+            let p2_attach = PswapNoteAttachment::new(AssetAmount::new(30).unwrap(), pswap.order_id(), 2);
+            let payback_2 = pswap.payback_note(bob(), &p2_attach).unwrap();
+
+            let inclusion_proof = dummy_inclusion_proof(15);
+            let observer = PswapChainObserver::new(
+                store.clone(),
+                build_mock_rpc(vec![
+                    (payback_1.id(), fetched_private(&payback_1, &inclusion_proof)),
+                    (remainder_1.id(), fetched_private(&remainder_1, &inclusion_proof)),
+                    (payback_2.id(), fetched_private(&payback_2, &inclusion_proof)),
+                ]),
+            );
+            observer.observe(&commit_note(&payback_1, &inclusion_proof)).await?;
+            observer.observe(&commit_note(&remainder_1, &inclusion_proof)).await?;
+            observer.observe(&commit_note(&payback_2, &inclusion_proof)).await?;
+
+            // BOTH P0 and the round-1 remainder are in the consumed window.
+            observer.apply(&nullifier_window(vec![
+                (p0_nullifier, 15),
+                (remainder_1.nullifier(), 15),
+            ])).await?;
+
+            let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
+            assert_eq!(lineage.current_depth, 2, "advanced through both rounds in one sync");
+            assert_eq!(lineage.state, PswapLineageState::FullyFilled);
+            assert_eq!(lineage.remaining_offered, AssetAmount::ZERO);
+            assert_eq!(lineage.remaining_requested, AssetAmount::ZERO);
+            Ok(())
+        }
+
+        // =================================================================
+        // SECURITY / ADVERSARIAL SCENARIOS
+        // =================================================================
+
+        /// **Security**: a PSWAP-attachment note belonging to an order we
+        /// DON'T track must not affect our store. Defense-in-depth: even
+        /// though the SQL filter in `discover_pswap_rounds`
+        /// (`ActiveByTipNullifiers`) doesn't return it, the `apply()`
+        /// active-lineage filter is the second line of defense — both
+        /// must agree on "not ours, skip".
+        #[tokio::test]
+        async fn foreign_pswap_attachment_note_is_filtered_out() -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+
+            // Build a PSWAP whose order_id this client does NOT track (we
+            // never call upsert_pswap_lineage for it).
+            let foreign = {
+                let sender = AccountId::try_from(
+                    ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+                ).unwrap();
+                let creator = AccountId::try_from(
+                    ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+                ).unwrap();
+                let offered_faucet = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+                let requested_faucet = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
+                let storage = PswapNoteStorage::builder()
+                    .requested_asset(FungibleAsset::new(requested_faucet, 50).unwrap())
+                    .creator_account_id(creator)
+                    .build();
+                PswapNote::builder()
+                    .sender(sender)
+                    .storage(storage)
+                    .serial_number(Word::from([
+                        miden_protocol::Felt::new(99).unwrap(),
+                        miden_protocol::Felt::new(98).unwrap(),
+                        miden_protocol::Felt::new(97).unwrap(),
+                        miden_protocol::Felt::new(96).unwrap(),
+                    ]))
+                    .note_type(NoteType::Private)
+                    .offered_asset(FungibleAsset::new(offered_faucet, 100).unwrap())
+                    .build()
+                    .unwrap()
+            };
+
+            // Foreign filler emits a payback for the foreign PSWAP.
+            let foreign_payback = foreign
+                .payback_note(bob(), &PswapNoteAttachment::new(
+                    AssetAmount::new(20).unwrap(), foreign.order_id(), 1,
+                ))
+                .unwrap();
+
+            let inclusion_proof = dummy_inclusion_proof(5);
+            let observer = PswapChainObserver::new(
+                store.clone(),
+                build_mock_rpc(vec![(
+                    foreign_payback.id(),
+                    fetched_private(&foreign_payback, &inclusion_proof),
+                )]),
+            );
+
+            // We see the note arrive in sync.
+            observer.observe(&commit_note(&foreign_payback, &inclusion_proof)).await?;
+            // And the foreign PSWAP's nullifier is in the consumed window.
+            let foreign_p0_null = Note::from(foreign.clone()).nullifier();
+            observer.apply(&nullifier_window(vec![(foreign_p0_null, 5)])).await?;
+
+            // Store must remain empty — we never tracked this lineage.
+            assert!(
+                store.get_pswap_lineage(foreign.order_id()).await?.is_none(),
+                "foreign PSWAP must not be inserted into our store",
+            );
+            Ok(())
+        }
+
+        /// **Security**: a stale-depth note (a payback we already processed
+        /// or never expected at this depth) must not advance the lineage.
+        /// The forward-only depth filter in `build_chain_note_updates`
+        /// (`if depth < lineage.current_depth + 1`) catches replays.
+        #[tokio::test]
+        async fn stale_depth_payback_does_not_advance_lineage() -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+            let pswap = build_private_test_pswap(100, 50);
+
+            // Insert lineage as if round 1 ALREADY happened (current_depth=1).
+            let mut record = super::build_initial_record(pswap.clone());
+            let r1_attach = PswapNoteAttachment::new(AssetAmount::new(40).unwrap(), pswap.order_id(), 1);
+            let already_at = pswap.remainder_note(
+                bob(), &r1_attach,
+                AssetAmount::new(60).unwrap(), AssetAmount::new(30).unwrap(),
+            ).unwrap();
+            record.current_depth = 1;
+            record.current_tip_note_id = already_at.id();
+            record.current_tip_nullifier = already_at.nullifier();
+            record.remaining_offered = AssetAmount::new(60).unwrap();
+            record.remaining_requested = AssetAmount::new(30).unwrap();
+            record.last_consumer_account_id = Some(bob());
+            record.last_payout_amount = Some(AssetAmount::new(40).unwrap());
+            store.upsert_pswap_lineage(&record).await?;
+
+            // Sync replays an old depth-1 payback (stale).
+            let stale_payback = pswap.payback_note(
+                bob(),
+                &PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1),
+            ).unwrap();
+
+            let inclusion_proof = dummy_inclusion_proof(20);
+            let observer = PswapChainObserver::new(
+                store.clone(),
+                build_mock_rpc(vec![(
+                    stale_payback.id(),
+                    fetched_private(&stale_payback, &inclusion_proof),
+                )]),
+            );
+            observer.observe(&commit_note(&stale_payback, &inclusion_proof)).await?;
+            // NOTE: we deliberately do NOT include any nullifier — no new
+            // round happened. Just a stale note replay.
+            observer.apply(&nullifier_window(vec![])).await?;
+
+            let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
+            assert_eq!(lineage.current_depth, 1, "stale depth-1 must not re-advance to 2");
+            assert_eq!(lineage.state, PswapLineageState::Active);
+            Ok(())
+        }
+
+        /// **Security**: a terminal-state lineage (FullyFilled or Reclaimed)
+        /// must NOT be advanced even if its old tip nullifier shows up in
+        /// the window again (e.g. via re-org or replayed sync data).
+        /// Two defenses: `ActiveByTipNullifiers` SQL filter excludes
+        /// non-Active rows; the apply() active-lineage filter is the second
+        /// line of defense.
+        #[tokio::test]
+        async fn terminal_lineage_is_not_re_advanced() -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+            let pswap = build_private_test_pswap(100, 50);
+
+            // Insert as FullyFilled.
+            let mut record = super::build_initial_record(pswap.clone());
+            record.state = PswapLineageState::FullyFilled;
+            store.upsert_pswap_lineage(&record).await?;
+            let p0_nullifier = Note::from(pswap.clone()).nullifier();
+
+            // Attempt to replay a fill on the terminal lineage.
+            let zombie_payback = pswap.payback_note(
+                bob(),
+                &PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1),
+            ).unwrap();
+            let inclusion_proof = dummy_inclusion_proof(30);
+            let observer = PswapChainObserver::new(
+                store.clone(),
+                build_mock_rpc(vec![(
+                    zombie_payback.id(),
+                    fetched_private(&zombie_payback, &inclusion_proof),
+                )]),
+            );
+            observer.observe(&commit_note(&zombie_payback, &inclusion_proof)).await?;
+            observer.apply(&nullifier_window(vec![(p0_nullifier, 30)])).await?;
+
+            // State unchanged: still FullyFilled at the same depth.
+            let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
+            assert_eq!(lineage.state, PswapLineageState::FullyFilled);
+            assert_eq!(lineage.current_depth, record.current_depth);
+            Ok(())
+        }
+
+        /// **Security**: a tampered attachment (filler/node claims a
+        /// different amount than the real on-chain note has) must NOT cause
+        /// the lineage to advance with the tampered values. The
+        /// commitment-mismatch fail-loud check in `reconstruct_payback`
+        /// catches it: the reconstructed note id won't match the on-chain id.
+        ///
+        /// This is the core security property: the on-chain note id is
+        /// derived from the attachment commitment, so any attempt to lie
+        /// about the attachment content can be detected at reconstruction.
+        #[tokio::test]
+        async fn tampered_attachment_amount_does_not_advance_lineage() -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+            let pswap = build_private_test_pswap(100, 50);
+            store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
+            let p0_nullifier = Note::from(pswap.clone()).nullifier();
+
+            // Build a LEGIT payback with the real amount (20 RA) → real note id.
+            let legit_attach =
+                PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1);
+            let legit_payback = pswap.payback_note(bob(), &legit_attach).unwrap();
+
+            // Build a TAMPERED payback claiming a different amount (99 RA) —
+            // its attachments encode (99, order_id, 1, 0) but we'll lie about
+            // the note id to claim it matches the legit one.
+            let tampered_attach =
+                PswapNoteAttachment::new(AssetAmount::new(99).unwrap(), pswap.order_id(), 1);
+            let tampered_payback = pswap.payback_note(bob(), &tampered_attach).unwrap();
+            // tampered_payback.id() != legit_payback.id() because amount differs.
+
+            // The malicious mock: it returns the LEGIT note id but with the
+            // TAMPERED attachments (claiming 99 RA instead of 20 RA).
+            let inclusion_proof = dummy_inclusion_proof(42);
+            let malicious_fetched = FetchedNote::Private(
+                legit_payback.id(),                       // ← legit id
+                *tampered_payback.metadata(),             // ← but tampered metadata
+                inclusion_proof.clone(),
+                tampered_payback.attachments().clone(),   // ← and tampered attachments
+            );
+
+            let observer = PswapChainObserver::new(
+                store.clone(),
+                build_mock_rpc(vec![(legit_payback.id(), malicious_fetched)]),
+            );
+
+            // We "observe" the legit-id committed note. Sync delivers metadata
+            // for it (the on-chain commitment is real); but the attachment we
+            // fetch via the malicious node is tampered.
+            let committed = miden_client::rpc::domain::note::CommittedNote::new(
+                legit_payback.id(),
+                *tampered_payback.metadata(),
+                inclusion_proof.clone(),
+            );
+            observer.observe(&committed).await?;
+            // discover_pswap_rounds catches the mismatch and *logs* but
+            // doesn't propagate (by design — one bad lineage shouldn't stall
+            // sync). The lineage stays at depth 0.
+            observer.apply(&nullifier_window(vec![(p0_nullifier, 42)])).await?;
+
+            let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
+            assert_eq!(lineage.current_depth, 0, "tampered payback must NOT advance the lineage");
+            assert_eq!(lineage.state, PswapLineageState::Active);
+            assert_eq!(lineage.remaining_offered, AssetAmount::new(100).unwrap());
+            assert_eq!(lineage.remaining_requested, AssetAmount::new(50).unwrap());
+            Ok(())
+        }
+
+        /// Defensive fast-path: empty sync window AND empty pending → no
+        /// store query, no RPC call, return Ok early. Verifies the
+        /// short-circuit doesn't accidentally touch the store.
+        #[tokio::test]
+        async fn empty_sync_is_no_op() -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+            let pswap = build_private_test_pswap(100, 50);
+            let record = super::build_initial_record(pswap.clone());
+            store.upsert_pswap_lineage(&record).await?;
+
+            let observer = PswapChainObserver::new(store.clone(), build_mock_rpc(vec![]));
+            // No observe() calls, empty nullifier window.
+            observer.apply(&nullifier_window(vec![])).await?;
+
+            // Lineage untouched.
+            let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
+            assert_eq!(lineage.current_depth, 0);
+            assert_eq!(lineage.state, PswapLineageState::Active);
             Ok(())
         }
     }

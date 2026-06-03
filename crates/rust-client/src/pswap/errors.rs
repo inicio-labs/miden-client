@@ -34,14 +34,6 @@ pub enum PswapLineageError {
     #[error("PSWAP note reconstruction failed: {0}")]
     Reconstruction(#[source] NoteError),
 
-    /// Reconstructed note id doesn't match the observed id — fail-loud
-    /// (protocol/client version skew or row corruption).
-    #[error(
-        "reconstructed PSWAP note id {reconstructed} does not match observed id {observed}; \
-         lineage round skipped to avoid corruption (protocol/client version skew or row corruption)"
-    )]
-    CommitmentMismatch { reconstructed: String, observed: String },
-
     /// SQLite read a `state` byte with no matching [`PswapLineageState`] variant.
     #[error("unknown PSWAP lineage state byte: {0}")]
     UnknownState(u8),

@@ -156,14 +156,10 @@ impl SqliteStore {
     }
 }
 
-/// Removes the `(asset_pair_tag, Subscription(order_id))` row in `tags`
-/// for the given lineage. Deserialises the row's `original_pswap` to
-/// recompute the tag — the round update does not carry it.
-///
-/// Idempotent: returns `Ok(())` when no row matches (e.g. the tag was
-/// already removed by a previous terminal transition that crashed
-/// post-commit, or never inserted because the lineage predates the
-/// tag-registration code path).
+/// Removes the `(asset_pair_tag, Subscription(original_note_id))` row in
+/// `tags` for the given lineage. Deserialises the row's `original_pswap`
+/// to recompute the tag AND the original NoteId (neither is carried on
+/// the round update). Idempotent.
 fn remove_pswap_asset_pair_tag_tx(
     tx: &Transaction<'_>,
     order_id: Felt,
@@ -188,10 +184,11 @@ fn remove_pswap_asset_pair_tag_tx(
         pswap.offered_asset(),
         pswap.storage().requested_asset(),
     );
+    let original_note_id = note.id();
 
     remove_note_tag_tx(
         tx,
-        NoteTagRecord { tag, source: NoteTagSource::Subscription(order_id) },
+        NoteTagRecord { tag, source: NoteTagSource::Subscription(original_note_id) },
     )?;
     Ok(())
 }

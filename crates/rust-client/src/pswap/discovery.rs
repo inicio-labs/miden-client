@@ -13,7 +13,6 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use miden_protocol::Felt;
 use miden_protocol::asset::AssetAmount;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{Note, Nullifier};
@@ -28,6 +27,7 @@ use super::lineage::{
     PswapLineageState,
 };
 use super::observer::PswapChainNoteUpdate;
+use super::types::OrderIdKey;
 use crate::ClientError;
 use crate::store::Store;
 use crate::sync::StateSyncUpdate;
@@ -63,20 +63,22 @@ pub async fn discover_pswap_rounds(
         .iter()
         .map(|(nullifier, _)| *nullifier)
         .collect();
-    let candidates = store
+    let active_lineages = store
         .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(consumed_nullifiers))
         .await?;
-    if candidates.is_empty() {
+    if active_lineages.is_empty() {
         return Ok(Vec::new());
     }
 
     // Group observed notes by (order_id, depth) for O(1) per-round lookup.
+    // `or_insert_with(Vec::new)` (vs `or_default`) makes the default value
+    // explicit at the call site.
     let mut notes_by_order_depth: BTreeMap<(OrderIdKey, u32), Vec<&PswapChainNoteUpdate>> =
         BTreeMap::new();
     for note in chain_note_updates {
         notes_by_order_depth
             .entry((OrderIdKey::from(note.order_id), note.depth))
-            .or_default()
+            .or_insert_with(Vec::new)
             .push(note);
     }
 
@@ -90,7 +92,7 @@ pub async fn discover_pswap_rounds(
 
     let mut round_updates: Vec<PswapLineageRoundUpdate> = Vec::new();
 
-    for lineage_record in candidates {
+    for lineage_record in active_lineages {
         let mut lineage = lineage_record;
 
         // Walk forward through every round consumed this sync — the inner
@@ -99,7 +101,7 @@ pub async fn discover_pswap_rounds(
         while let Some(&at_block_num) = nullifier_to_block.get(&lineage.current_tip_nullifier) {
             let round_depth = lineage.current_depth + 1;
             let notes = notes_by_order_depth
-                .get(&(OrderIdKey::from(lineage.order_id()), round_depth))
+                .get(&(lineage.order_id_key(), round_depth))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
 
@@ -162,13 +164,10 @@ fn build_round_update(
             }))
         },
         1 => {
-            // Full fill — only a payback was emitted.
+            // Full fill — only a payback was emitted. By definition, all
+            // remaining requested has been consumed → remaining_requested = 0.
             let payback_note_update = notes[0];
             let payback = reconstruct_payback(original, payback_note_update, round_depth)?;
-
-            // Saturating sub preserves v1 "round off over-fill" semantics.
-            let remaining_requested = (lineage.remaining_requested - payback_note_update.amount)
-                .unwrap_or(AssetAmount::ZERO);
 
             Ok(Some(PswapLineageRoundUpdate {
                 order_id: lineage.order_id(),
@@ -177,7 +176,7 @@ fn build_round_update(
                 fill_amount: payback_note_update.amount,
                 payout_amount: lineage.remaining_offered,
                 remaining_offered: AssetAmount::ZERO,
-                remaining_requested,
+                remaining_requested: AssetAmount::ZERO,
                 state: PswapLineageState::FullyFilled,
                 tip_note_id: None,
                 tip_nullifier: None,
@@ -222,7 +221,7 @@ fn build_round_update(
                 .map_err(PswapLineageError::Reconstruction)?;
 
             if remainder_note.id() != remainder_note_update.note_id {
-                return Err(PswapLineageError::CommitmentMismatch {
+                return Err(ClientError::NoteCommitmentMismatch {
                     reconstructed: format!("{}", remainder_note.id().as_word()),
                     observed: format!("{}", remainder_note_update.note_id.as_word()),
                 }
@@ -266,7 +265,7 @@ fn reconstruct_payback(
         .payback_note(note_update.sender, &attachment)
         .map_err(PswapLineageError::Reconstruction)?;
     if reconstructed.id() != note_update.note_id {
-        return Err(PswapLineageError::CommitmentMismatch {
+        return Err(ClientError::NoteCommitmentMismatch {
             reconstructed: format!("{}", reconstructed.id().as_word()),
             observed: format!("{}", note_update.note_id.as_word()),
         }
@@ -306,37 +305,6 @@ impl PswapLineageRecord {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Felt helpers — Felt does not implement `Ord`/`Hash`/`Display`, so we wrap.
-// -----------------------------------------------------------------------------
-
-/// Wrapper over `Felt` providing `Ord` for use as a `BTreeMap` key.
-#[derive(Clone, Copy)]
-struct OrderIdKey(Felt);
-
-impl From<Felt> for OrderIdKey {
-    fn from(value: Felt) -> Self {
-        Self(value)
-    }
-}
-
-impl PartialEq for OrderIdKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.as_canonical_u64() == other.0.as_canonical_u64()
-    }
-}
-impl Eq for OrderIdKey {}
-impl PartialOrd for OrderIdKey {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for OrderIdKey {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.0.as_canonical_u64().cmp(&other.0.as_canonical_u64())
-    }
-}
-
 // =============================================================================
 // TESTS
 // =============================================================================
@@ -354,6 +322,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
+    use miden_protocol::Felt;
     use miden_protocol::account::AccountId;
     use miden_protocol::asset::AssetAmount;
     use miden_protocol::crypto::merkle::SparseMerklePath;

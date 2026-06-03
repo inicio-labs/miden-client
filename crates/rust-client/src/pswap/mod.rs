@@ -25,6 +25,7 @@ pub mod discovery;
 pub mod errors;
 pub mod lineage;
 pub mod observer;
+mod types;
 
 pub use errors::PswapLineageError;
 pub use lineage::{PswapLineageFilter, PswapLineageRecord, PswapLineageRoundUpdate, PswapLineageState};
@@ -88,21 +89,15 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
 
             let record = build_initial_lineage_record(note, &pswap, submission_height);
             let asset_pair_tag = record.asset_pair_tag();
-            let order_id = record.order_id();
+            let original_note_id = record.current_tip_note_id;
 
             self.store.upsert_pswap_lineage(&record).await?;
-            // Mirrors the pattern in `account/mod.rs` for
-            // `NoteTagSource::Account`: internal subsystems that own a
-            // non-`User` tag source call the store directly with a full
-            // `NoteTagRecord`. `Client::add_note_tag(tag)` is the
-            // user-facing convenience wrapper that hard-codes
-            // `NoteTagSource::User`; we need the typed `Subscription`
-            // source so the tag is reference-counted per-lineage and
-            // dropped on terminal state (see `apply_pswap_round`).
+            // Subscription keyed by the original PSWAP's NoteId — generic
+            // enough for any future observer with a subscription lifecycle.
             self.store
                 .add_note_tag(NoteTagRecord {
                     tag: asset_pair_tag,
-                    source: NoteTagSource::Subscription(order_id),
+                    source: NoteTagSource::Subscription(original_note_id),
                 })
                 .await?;
         }

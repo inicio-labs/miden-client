@@ -484,17 +484,8 @@ where
 
         self.apply_transaction_update(tx_update).await?;
 
-        // Record any new PSWAP orders this transaction created. Runs
-        // after the store apply succeeds so a PSWAP lineage row is
-        // only inserted for a transaction that actually landed. This
-        // hook is intentionally on the `apply_transaction` path
-        // (which has `TransactionResult`) rather than
-        // `apply_transaction_update` because the batch path that calls
-        // `apply_transaction_update` directly does not currently
-        // support PSWAP creates — see plan §5.1. If batch PSWAP create
-        // becomes a use case, hoist this call down into
-        // `apply_transaction_update` once `TransactionStoreUpdate`
-        // surfaces the executed transaction's submission height.
+        // Record any new PSWAP orders this transaction created (after store
+        // apply, so lineage rows only exist for landed transactions).
         self.record_created_pswap_lineages(tx_result, submission_height).await?;
 
         Ok(())

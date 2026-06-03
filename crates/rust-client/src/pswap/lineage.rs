@@ -4,6 +4,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use miden_protocol::Felt;
 use miden_protocol::Word;
@@ -18,23 +19,16 @@ use super::errors::PswapLineageError;
 // PSWAP LINEAGE STATE
 // ================================================================================================
 
-/// Terminal lifecycle states of a PSWAP order.
-///
-/// Stored as the `state` column on the `pswap_lineages` table. The numeric
-/// values are part of the on-disk encoding and must remain stable across
-/// schema versions; consult `crates/sqlite-store/src/store.sql` before
-/// renumbering.
+/// Lifecycle state of a PSWAP order. Numeric values are part of the
+/// on-disk encoding — do not renumber (see `sqlite-store/src/store.sql`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PswapLineageState {
-    /// The order is still active — `current_tip_*` columns describe a live
-    /// PSWAP note that can be filled further or reclaimed.
+    /// Still fillable / reclaimable.
     Active = 0,
-    /// Every requested unit was filled. No more rounds will arrive; the row
-    /// is kept for historical querying.
+    /// Fully filled. Terminal.
     FullyFilled = 1,
-    /// The creator reclaimed the remaining offered amount via
-    /// `build_pswap_cancel`. No more rounds will arrive.
+    /// Reclaimed by the creator. Terminal.
     Reclaimed = 2,
 }
 
@@ -128,6 +122,12 @@ impl PswapLineageRecord {
     /// by every note in the chain, surfaced in attachment word slot `[1]`.
     pub fn order_id(&self) -> Felt {
         self.original_pswap.order_id()
+    }
+
+    /// `order_id()` wrapped in the `Ord`/`Eq`-compatible
+    /// [`crate::pswap::types::OrderIdKey`] for use as a `BTreeMap` key.
+    pub(crate) fn order_id_key(&self) -> super::types::OrderIdKey {
+        super::types::OrderIdKey::from(self.order_id())
     }
 
     /// ID of the original (depth-0) PSWAP note.
@@ -273,7 +273,7 @@ pub enum PswapLineageFilter {
     /// the lineages whose tip was consumed in this sync window — avoids the
     /// "load every active lineage" scan when activity is sparse. See
     /// [`crate::pswap::discovery::discover_pswap_rounds`].
-    ActiveByTipNullifiers(alloc::vec::Vec<Nullifier>),
+    ActiveByTipNullifiers(Vec<Nullifier>),
 }
 
 // SERDE HELPERS

@@ -1,9 +1,8 @@
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use miden_protocol::Felt;
 use miden_protocol::account::{Account, AccountId};
-use miden_protocol::note::{NoteDetailsCommitment, NoteTag};
+use miden_protocol::note::{NoteDetailsCommitment, NoteId, NoteTag};
 use miden_tx::utils::serde::{
     ByteReader,
     ByteWriter,
@@ -80,12 +79,12 @@ pub enum NoteTagSource {
     /// Tag manually added by the user.
     User,
     /// Tag added by a feature subsystem for the duration of a subscription
-    /// lifecycle (inserted on subscribe, removed on unsubscribe). The `Felt`
-    /// is a feature-chosen key — only needs to be unique within that
-    /// feature so concurrent subscriptions sharing a tag deduplicate via
-    /// the `(tag, source)` composite key. Currently used by PSWAP chain
-    /// tracking with `order_id` as the key.
-    Subscription(Felt),
+    /// lifecycle (inserted on subscribe, removed on unsubscribe). The
+    /// [`NoteId`] is the subscription's anchor note (the original PSWAP for
+    /// PSWAP chain tracking; analogous note for future observers) — keyed
+    /// by NoteId so any observer can reuse the variant without inventing a
+    /// scheme-specific identifier.
+    Subscription(NoteId),
 }
 
 impl NoteTagRecord {
@@ -146,7 +145,7 @@ impl Deserializable for NoteTagSource {
             0 => Ok(NoteTagSource::Account(AccountId::read_from(source)?)),
             1 => Ok(NoteTagSource::Note(NoteDetailsCommitment::read_from(source)?)),
             2 => Ok(NoteTagSource::User),
-            3 => Ok(NoteTagSource::Subscription(Felt::read_from(source)?)),
+            3 => Ok(NoteTagSource::Subscription(NoteId::read_from(source)?)),
             val => Err(DeserializationError::InvalidValue(format!("Invalid tag source: {val}"))),
         }
     }
@@ -154,10 +153,17 @@ impl Deserializable for NoteTagSource {
 
 #[cfg(test)]
 mod tag_source_tests {
-    use miden_protocol::Felt;
+    use miden_protocol::Word;
+    use miden_protocol::note::NoteId;
     use miden_protocol::testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET;
 
     use super::{Deserializable, NoteTagSource, Serializable};
+
+    /// Helper: builds a deterministic `NoteId` from a single u64.
+    fn note_id_from_u64(value: u64) -> NoteId {
+        let f = miden_protocol::Felt::new(value).unwrap();
+        NoteId::from_raw(Word::from([f, f, f, f]))
+    }
 
     /// `NoteTagSource` is serialised into the on-disk `tags.source` BLOB
     /// column. The wire encoding starts with a `u8` discriminant —
@@ -169,7 +175,7 @@ mod tag_source_tests {
     fn note_tag_source_discriminants_are_stable() {
         let cases = [
             (NoteTagSource::User, 2u8),
-            (NoteTagSource::Subscription(Felt::new(42).unwrap()), 3u8),
+            (NoteTagSource::Subscription(note_id_from_u64(42)), 3u8),
         ];
         for (variant, expected_disc) in cases {
             let bytes = variant.to_bytes();
@@ -194,7 +200,7 @@ mod tag_source_tests {
                 miden_protocol::Word::empty(),
                 miden_protocol::Word::empty(),
             );
-        let subscription_key = Felt::new(0xDEAD_BEEF_DEAD_BEEF).unwrap();
+        let subscription_key = note_id_from_u64(0xDEAD_BEEF_DEAD_BEEF);
 
         let variants = [
             NoteTagSource::Account(account_id),

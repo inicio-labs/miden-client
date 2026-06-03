@@ -7,7 +7,6 @@ use miden_protocol::account::AccountId;
 use miden_protocol::errors::NoteError;
 
 use super::lineage::PswapLineageState;
-use crate::store::StoreError;
 
 /// Failures raised by the PSWAP chain-tracking subsystem.
 #[derive(Debug, thiserror::Error)]
@@ -41,8 +40,4 @@ pub enum PswapLineageError {
     /// A stored row's columns are mutually inconsistent.
     #[error("PSWAP lineage row is internally inconsistent: {0}")]
     InconsistentRow(String),
-
-    /// Propagated from the store layer.
-    #[error(transparent)]
-    Store(#[from] StoreError),
 }

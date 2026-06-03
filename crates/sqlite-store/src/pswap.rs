@@ -84,9 +84,6 @@ impl SqliteStore {
                 stmt.query(params![PswapLineageState::Active.as_u8()])
                     .into_store_error()?,
             )?,
-            PswapLineageFilter::ByOrderId(order_id) => {
-                collect_rows(stmt.query(params![order_id.to_bytes()]).into_store_error()?)?
-            },
             PswapLineageFilter::ActiveByTipNoteIds(_) => unreachable!("handled above"),
         };
 
@@ -187,7 +184,6 @@ fn sql_filter_part(filter: &PswapLineageFilter) -> &'static str {
     match filter {
         PswapLineageFilter::All | PswapLineageFilter::ByCreator(_) => "",
         PswapLineageFilter::Active => " WHERE state = ?",
-        PswapLineageFilter::ByOrderId(_) => " WHERE order_id = ?",
         // ActiveByTipNoteIds builds its SQL dynamically — see
         // list_active_by_tip_note_ids — and never routes through here.
         PswapLineageFilter::ActiveByTipNoteIds(_) => "",

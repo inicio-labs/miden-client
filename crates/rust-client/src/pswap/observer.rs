@@ -41,7 +41,7 @@ pub struct PswapChainNoteUpdate {
 
 /// Per-sync queue entry. Attachment word is fetched in `apply()` via
 /// `GetNotesById` (TEMP — see upstream PR #2214).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingPswapNote {
     note_id: NoteId,
     sender: AccountId,

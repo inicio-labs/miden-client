@@ -6,7 +6,6 @@ use alloc::format;
 use alloc::vec::Vec;
 
 use miden_protocol::Felt;
-use miden_protocol::Word;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
@@ -90,19 +89,9 @@ impl PswapLineageRecord {
         super::types::OrderIdKey::from(self.order_id())
     }
 
-    /// ID of the original (depth-0) PSWAP note.
-    pub fn initial_note_id(&self) -> NoteId {
-        Note::from(self.original_pswap.clone()).id()
-    }
-
     /// Account that created the order (recipient of every payback).
     pub fn creator_account_id(&self) -> AccountId {
         self.original_pswap.storage().creator_account_id()
-    }
-
-    /// Submitter of the create transaction.
-    pub fn sender_account_id(&self) -> AccountId {
-        self.original_pswap.sender()
     }
 
     pub fn offered_asset(&self) -> &FungibleAsset {
@@ -115,14 +104,6 @@ impl PswapLineageRecord {
 
     pub fn note_type(&self) -> NoteType {
         self.original_pswap.note_type()
-    }
-
-    pub fn payback_note_type(&self) -> NoteType {
-        self.original_pswap.storage().payback_note_type()
-    }
-
-    pub fn initial_serial_number(&self) -> Word {
-        self.original_pswap.serial_number()
     }
 
     /// Asset-pair tag — sync returns every remainder in this chain via it.
@@ -170,7 +151,6 @@ pub enum PswapLineageFilter {
     All,
     Active,
     ByCreator(AccountId),
-    ByOrderId(Felt),
     /// Active rows whose `current_tip_note_id` is in the given set.
     /// Empty input returns no rows. Used by `discover_pswap_rounds` to
     /// load only the lineages whose tip was consumed this sync.
@@ -282,7 +262,6 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use miden_protocol::Word;
     use miden_protocol::asset::AssetAmount;
 
     use super::test_helpers::{build_test_pswap, fixed_account_ids};
@@ -425,9 +404,6 @@ mod tests {
         assert_eq!(record.order_id(), expected_order_id);
         assert_eq!(record.asset_pair_tag(), expected_tag);
         assert_eq!(record.creator_account_id(), creator);
-
-        // Silence Word-unused warning from the test_helpers import.
-        let _ = Word::default();
     }
 }
 

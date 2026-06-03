@@ -78,38 +78,28 @@ impl TransactionObserver for PswapTransactionObserver {
                 continue;
             }
 
-            let record = build_initial_lineage_record(note, &pswap, submission_height);
-            let asset_pair_tag = record.asset_pair_tag();
-            let original_note_id = record.current_tip_note_id;
+            // At depth 0, remaining_* == initial offered/requested.
+            let record = PswapLineageRecord {
+                original_pswap: pswap.clone(),
+                current_tip_note_id: note.id(),
+                current_depth: 0,
+                remaining_offered: *pswap.offered_asset(),
+                remaining_requested: *pswap.storage().requested_asset(),
+                state: PswapLineageState::Active,
+                created_at_block: submission_height,
+                updated_at_block: submission_height,
+            };
 
             self.store.upsert_pswap_lineage(&record).await?;
             self.store
                 .add_note_tag(NoteTagRecord {
-                    tag: asset_pair_tag,
-                    source: NoteTagSource::Subscription(original_note_id),
+                    tag: record.asset_pair_tag(),
+                    source: NoteTagSource::Subscription(record.current_tip_note_id),
                 })
                 .await?;
         }
 
         Ok(())
-    }
-}
-
-fn build_initial_lineage_record(
-    note: &Note,
-    pswap: &PswapNote,
-    submission_height: BlockNumber,
-) -> PswapLineageRecord {
-    // At depth 0, remaining_* == initial offered/requested.
-    PswapLineageRecord {
-        original_pswap: pswap.clone(),
-        current_tip_note_id: note.id(),
-        current_depth: 0,
-        remaining_offered: pswap.offered_asset().clone(),
-        remaining_requested: pswap.storage().requested_asset().clone(),
-        state: PswapLineageState::Active,
-        created_at_block: submission_height,
-        updated_at_block: submission_height,
     }
 }
 

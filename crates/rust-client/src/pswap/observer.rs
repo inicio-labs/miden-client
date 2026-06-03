@@ -13,6 +13,7 @@ use miden_standards::note::{PswapNote, PswapNoteAttachment};
 use tracing::warn;
 
 use crate::ClientError;
+use crate::pswap::discovery::discover_pswap_rounds;
 use crate::rpc::NodeRpcClient;
 use crate::rpc::domain::note::{CommittedNote, FetchedNote};
 use crate::store::Store;
@@ -130,12 +131,8 @@ impl NoteObserver for PswapChainObserver {
             self.build_chain_note_updates(pending).await?
         };
 
-        let round_updates = crate::pswap::discovery::discover_pswap_rounds(
-            self.store.clone(),
-            sync_update,
-            &chain_note_updates,
-        )
-        .await?;
+        let round_updates =
+            discover_pswap_rounds(self.store.clone(), sync_update, &chain_note_updates).await?;
 
         for round_update in round_updates {
             if let Err(err) = self.store.apply_pswap_round(&round_update).await {

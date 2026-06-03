@@ -16,9 +16,10 @@ use crate::alloc::string::ToString;
 use crate::keystore::FilesystemKeyStore;
 use crate::keystore::Keystore;
 use crate::note_transport::NoteTransportClient;
+use crate::pswap::PswapTransactionObserver;
 use crate::rpc::{Endpoint, NodeRpcClient};
 use crate::store::{Store, StoreError};
-use crate::transaction::TransactionProver;
+use crate::transaction::{TransactionObserver, TransactionProver};
 use crate::{Client, ClientError, ClientRng, ClientRngBox, DebugMode, grpc_support};
 
 // CONSTANTS
@@ -521,10 +522,10 @@ where
         }
 
         // Built-in transaction observers fired by `apply_transaction`.
-        // PSWAP chain tracking is always-on; additional observers can be
-        // attached via `Client::with_transaction_observer`.
-        let transaction_observers: Vec<Arc<dyn crate::transaction::TransactionObserver>> =
-            vec![Arc::new(crate::pswap::PswapTransactionObserver::new(store.clone()))];
+        // Additional observers can be attached via
+        // `Client::with_transaction_observer`.
+        let transaction_observers: Vec<Arc<dyn TransactionObserver>> =
+            vec![Arc::new(PswapTransactionObserver::new(store.clone()))];
 
         // Construct and return the Client
         Ok(Client {

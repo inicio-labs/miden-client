@@ -394,10 +394,7 @@ pub struct Client<AUTH> {
     /// Cached [`PartialMmr`] for the chain's MMR. Lazily built from the store and kept in sync
     /// across sync/prune operations. `None` forces a rebuild on next access.
     partial_mmr: Option<CachedPartialMmr>,
-    /// Side-effect-only observers fired by `Client::apply_transaction`
-    /// after the transaction's standard updates are persisted. Built-in
-    /// PSWAP tracking is registered by `ClientBuilder::build()`;
-    /// additional observers can be added via
+    /// Observers fired by `apply_transaction`. See
     /// [`Client::with_transaction_observer`].
     transaction_observers: Vec<Arc<dyn transaction::TransactionObserver>>,
 }
@@ -491,10 +488,7 @@ impl<AUTH> Client<AUTH> {
         self.store.identifier()
     }
 
-    /// Registers an additional [`TransactionObserver`] that fires on every
-    /// `Client::apply_transaction` after the standard updates land.
-    /// Multiple observers can be registered; each is invoked independently
-    /// and per-observer failures are logged, never propagated.
+    /// Registers a [`TransactionObserver`]. Per-observer failures are logged.
     pub fn with_transaction_observer(
         &mut self,
         observer: Arc<dyn transaction::TransactionObserver>,

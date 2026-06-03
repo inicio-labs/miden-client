@@ -567,9 +567,7 @@ impl Store for SqliteStore {
         .await
     }
 
-    // PSWAP LINEAGES — bodies live in `crate::pswap::store_impl`. Rust's
-    // single-impl-per-trait rule + `#[async_trait]` proc-macro expansion
-    // order force the stubs to live here; they delegate one-liners.
+    // PSWAP lineages — bodies in `crate::pswap::store_impl`.
     async fn upsert_pswap_lineage(
         &self,
         record: &miden_client::pswap::PswapLineageRecord,

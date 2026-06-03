@@ -3,15 +3,13 @@
 //! notes collected by [`super::observer::PswapChainObserver`], emitting
 //! one [`super::lineage::PswapLineageRoundUpdate`] per round transition.
 //!
-//! See [`crate::pswap`] for overall design and the
-//! `pswap_creator_reconstructs_lineage_from_attachments` test in the
-//! protocol repo for the executable contract this implements.
+//! See [`crate::pswap`] for the overall design.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use miden_protocol::asset::{AssetAmount, FungibleAsset};
+use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::NoteId;
 use tracing::error;
@@ -29,9 +27,9 @@ use crate::ClientError;
 use crate::store::Store;
 use crate::sync::StateSyncUpdate;
 
-// -----------------------------------------------------------------------------
+// ================================================================================================
 // PUBLIC ENTRY POINT
-// -----------------------------------------------------------------------------
+// ================================================================================================
 
 /// Returns one [`PswapLineageRoundUpdate`] per round advanced this sync.
 /// Inner loop catches same-block multi-fill via in-memory advancement.
@@ -104,25 +102,22 @@ pub async fn discover_pswap_rounds(
     Ok(round_updates)
 }
 
-// -----------------------------------------------------------------------------
+// ================================================================================================
 // PER-ROUND CLASSIFICATION
-// -----------------------------------------------------------------------------
+// ================================================================================================
 
 /// Builds one round's [`PswapLineageRoundUpdate`].
 fn build_round_update(
     lineage: &PswapLineageRecord,
     round_depth: u32,
-    at_block_num: BlockNumber,
+    at_block_number: BlockNumber,
     notes: &[&PswapChainNoteUpdate],
 ) -> Result<Option<PswapLineageRoundUpdate>, ClientError> {
-    let original = &lineage.original_pswap;
-    let offered_faucet = original.offered_asset().faucet_id();
-    let requested_faucet = original.storage().requested_asset().faucet_id();
+    let pswap = &lineage.original_pswap;
+    let offered_faucet = pswap.offered_asset().faucet_id();
+    let requested_faucet = pswap.storage().requested_asset().faucet_id();
     let zero_offered = FungibleAsset::new(offered_faucet, 0).expect("FA(_, 0) is always valid");
     let zero_requested = FungibleAsset::new(requested_faucet, 0).expect("FA(_, 0) is always valid");
-    // payback → requested faucet (fill); remainder → offered faucet (payout).
-    let to_fill = |amount: AssetAmount| FungibleAsset::new(requested_faucet, u64::from(amount));
-    let to_payout = |amount: AssetAmount| FungibleAsset::new(offered_faucet, u64::from(amount));
 
     match notes.len() {
         0 => {
@@ -137,7 +132,7 @@ fn build_round_update(
                 remaining_requested: zero_requested,
                 state: PswapLineageState::Reclaimed,
                 tip_note_id: None,
-                at_block: at_block_num,
+                at_block: at_block_number,
                 payback: None,
                 payback_inclusion_proof: None,
                 remainder: None,
@@ -147,11 +142,14 @@ fn build_round_update(
         1 => {
             // Full fill — only payback emitted; remaining_requested → 0.
             let payback_note_update = notes[0];
-            let payback = original
+            let payback = pswap
                 .payback_note(payback_note_update.sender, &payback_note_update.attachment)
                 .map_err(PswapLineageError::Reconstruction)?;
-            let fill_amount = to_fill(payback_note_update.attachment.amount())
-                .map_err(ClientError::AssetError)?;
+            let fill_amount = FungibleAsset::new(
+                requested_faucet,
+                u64::from(payback_note_update.attachment.amount()),
+            )
+            .map_err(ClientError::AssetError)?;
 
             Ok(Some(PswapLineageRoundUpdate {
                 order_id: lineage.order_id(),
@@ -163,7 +161,7 @@ fn build_round_update(
                 remaining_requested: zero_requested,
                 state: PswapLineageState::FullyFilled,
                 tip_note_id: None,
-                at_block: at_block_num,
+                at_block: at_block_number,
                 payback: Some(payback),
                 payback_inclusion_proof: Some(payback_note_update.inclusion_proof.clone()),
                 remainder: None,
@@ -172,21 +170,27 @@ fn build_round_update(
         },
         2 => {
             // Partial fill — payback + remainder. Distinguish by tag.
-            let payback_tag = original.storage().payback_note_tag();
+            let payback_tag = pswap.storage().payback_note_tag();
             let (payback_note_update, remainder_note_update) = if notes[0].tag == payback_tag {
                 (notes[0], notes[1])
             } else {
                 (notes[1], notes[0])
             };
 
-            let payback_note = original
+            let payback_note = pswap
                 .payback_note(payback_note_update.sender, &payback_note_update.attachment)
                 .map_err(PswapLineageError::Reconstruction)?;
 
-            let fill_amount = to_fill(payback_note_update.attachment.amount())
-                .map_err(ClientError::AssetError)?;
-            let payout_amount = to_payout(remainder_note_update.attachment.amount())
-                .map_err(ClientError::AssetError)?;
+            let fill_amount = FungibleAsset::new(
+                requested_faucet,
+                u64::from(payback_note_update.attachment.amount()),
+            )
+            .map_err(ClientError::AssetError)?;
+            let payout_amount = FungibleAsset::new(
+                offered_faucet,
+                u64::from(remainder_note_update.attachment.amount()),
+            )
+            .map_err(ClientError::AssetError)?;
 
             // Saturating sub — clamp to zero on over-fill.
             let remaining_requested = lineage.remaining_requested.sub(fill_amount)
@@ -194,7 +198,7 @@ fn build_round_update(
             let remaining_offered = lineage.remaining_offered.sub(payout_amount)
                 .unwrap_or(zero_offered);
 
-            let remainder_note = original
+            let remainder_note = pswap
                 .remainder_note(
                     remainder_note_update.sender,
                     &remainder_note_update.attachment,
@@ -212,7 +216,7 @@ fn build_round_update(
                 remaining_requested,
                 state: PswapLineageState::Active,
                 tip_note_id: Some(remainder_note_update.note_id),
-                at_block: at_block_num,
+                at_block: at_block_number,
                 payback: Some(payback_note),
                 payback_inclusion_proof: Some(payback_note_update.inclusion_proof.clone()),
                 remainder: Some(remainder_note),
@@ -223,9 +227,9 @@ fn build_round_update(
     }
 }
 
-// -----------------------------------------------------------------------------
+// ================================================================================================
 // IN-MEMORY LINEAGE ADVANCE
-// -----------------------------------------------------------------------------
+// ================================================================================================
 
 impl PswapLineageRecord {
     /// Returns the post-round version. Drives the same-block multi-fill loop.
@@ -272,10 +276,6 @@ mod tests {
             depth,
         )
     }
-    fn asset_amount(v: u64) -> AssetAmount {
-        AssetAmount::new(v).expect("amount fits in AssetAmount")
-    }
-
     /// Minimum-valid inclusion proof — correlator never inspects the path.
     fn dummy_inclusion_proof(block: u32) -> NoteInclusionProof {
         let path = SparseMerklePath::from_parts(0, Vec::new())
@@ -347,7 +347,7 @@ mod tests {
         let remainder_att = pswap_attachment(&pswap, 1, payout_amount);
         let payback = pswap.payback_note(consumer, &payback_att).unwrap();
         let remainder = pswap
-            .remainder_note(consumer, &remainder_att, asset_amount(new_off), asset_amount(new_req))
+            .remainder_note(consumer, &remainder_att, AssetAmount::new(new_off).unwrap(), AssetAmount::new(new_req).unwrap())
             .unwrap();
 
         let cand_payback = chain_update_from(&payback, payback_att, consumer, 7);
@@ -364,10 +364,10 @@ mod tests {
 
         assert_eq!(update.round_depth, 1);
         assert_eq!(update.consumer_account_id, consumer);
-        assert_eq!(update.fill_amount.amount(), asset_amount(fill_amount));
-        assert_eq!(update.payout_amount.amount(), asset_amount(payout_amount));
-        assert_eq!(update.remaining_offered.amount(), asset_amount(new_off));
-        assert_eq!(update.remaining_requested.amount(), asset_amount(new_req));
+        assert_eq!(update.fill_amount.amount(), AssetAmount::new(fill_amount).unwrap());
+        assert_eq!(update.payout_amount.amount(), AssetAmount::new(payout_amount).unwrap());
+        assert_eq!(update.remaining_offered.amount(), AssetAmount::new(new_off).unwrap());
+        assert_eq!(update.remaining_requested.amount(), AssetAmount::new(new_req).unwrap());
         assert_eq!(update.state, PswapLineageState::Active);
         assert_eq!(update.tip_note_id, Some(remainder.id()));
         assert!(update.payback.is_some());
@@ -402,8 +402,8 @@ mod tests {
             .expect("full fill must produce a round update");
 
         assert_eq!(update.state, PswapLineageState::FullyFilled);
-        assert_eq!(update.fill_amount.amount(), asset_amount(fill_amount));
-        assert_eq!(update.payout_amount.amount(), asset_amount(30)); // entire remaining_offered
+        assert_eq!(update.fill_amount.amount(), AssetAmount::new(fill_amount).unwrap());
+        assert_eq!(update.payout_amount.amount(), AssetAmount::new(30).unwrap()); // entire remaining_offered
         assert_eq!(update.remaining_offered.amount(), AssetAmount::ZERO);
         assert_eq!(update.remaining_requested.amount(), AssetAmount::ZERO);
         assert_eq!(update.tip_note_id, None);
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(update.state, PswapLineageState::Reclaimed);
         assert_eq!(update.consumer_account_id, creator);
         assert_eq!(update.fill_amount.amount(), AssetAmount::ZERO);
-        assert_eq!(update.payout_amount.amount(), asset_amount(80));
+        assert_eq!(update.payout_amount.amount(), AssetAmount::new(80).unwrap());
         assert_eq!(update.remaining_offered.amount(), AssetAmount::ZERO);
         // Regression: reclaim used to leak the pre-reclaim
         // `remaining_requested` into the terminal row.
@@ -469,7 +469,7 @@ mod tests {
         let remainder_att1 = pswap_attachment(&pswap, 1, payout1);
         let payback1 = pswap.payback_note(consumer, &payback_att1).unwrap();
         let remainder1 = pswap
-            .remainder_note(consumer, &remainder_att1, asset_amount(new_off1), asset_amount(new_req1))
+            .remainder_note(consumer, &remainder_att1, AssetAmount::new(new_off1).unwrap(), AssetAmount::new(new_req1).unwrap())
             .unwrap();
         let cand_p1 = chain_update_from(&payback1, payback_att1, consumer, 11);
         let cand_r1 = chain_update_from(&remainder1, remainder_att1, consumer, 11);
@@ -482,8 +482,8 @@ mod tests {
         // Mirrors `discover_pswap_rounds`'s inner loop.
         let record1 = record0.apply_round_in_memory(&update1);
         assert_eq!(record1.current_depth, 1);
-        assert_eq!(record1.remaining_offered.amount(), asset_amount(new_off1));
-        assert_eq!(record1.remaining_requested.amount(), asset_amount(new_req1));
+        assert_eq!(record1.remaining_offered.amount(), AssetAmount::new(new_off1).unwrap());
+        assert_eq!(record1.remaining_requested.amount(), AssetAmount::new(new_req1).unwrap());
         assert_eq!(record1.current_tip_note_id, remainder1.id());
         assert_eq!(record1.state, PswapLineageState::Active);
 
@@ -499,8 +499,8 @@ mod tests {
 
         assert_eq!(update2.round_depth, 2);
         assert_eq!(update2.state, PswapLineageState::FullyFilled);
-        assert_eq!(update2.fill_amount.amount(), asset_amount(fill2));
-        assert_eq!(update2.payout_amount.amount(), asset_amount(new_off1)); // remaining_offered exhausted
+        assert_eq!(update2.fill_amount.amount(), AssetAmount::new(fill2).unwrap());
+        assert_eq!(update2.payout_amount.amount(), AssetAmount::new(new_off1).unwrap()); // remaining_offered exhausted
         assert_eq!(update2.remaining_offered.amount(), AssetAmount::ZERO);
         assert_eq!(update2.remaining_requested.amount(), AssetAmount::ZERO);
 

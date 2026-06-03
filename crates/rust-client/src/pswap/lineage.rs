@@ -17,8 +17,8 @@ use super::errors::PswapLineageError;
 // PSWAP LINEAGE STATE
 // ================================================================================================
 
-/// Lifecycle state of a PSWAP order. Numeric values are part of the
-/// on-disk encoding — do not renumber (see `sqlite-store/src/store.sql`).
+/// Lifecycle state of a PSWAP order. Discriminants are part of the
+/// on-disk encoding — do not renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PswapLineageState {
@@ -31,13 +31,12 @@ pub enum PswapLineageState {
 }
 
 impl PswapLineageState {
-    /// Returns the byte representation used in the SQL `state` column.
     pub fn as_u8(self) -> u8 {
         self as u8
     }
 
-    /// Parses a state byte from the SQL `state` column. Errors on unknown
-    /// discriminants — defensive against forward-incompatible schema versions.
+    /// Errors on unknown discriminants — guards against forward-
+    /// incompatible row encodings.
     pub fn try_from_u8(value: u8) -> Result<Self, PswapLineageError> {
         match value {
             0 => Ok(Self::Active),
@@ -64,16 +63,10 @@ pub struct PswapLineageRecord {
     pub current_tip_note_id: NoteId,
     /// 0 for the original tip; +1 per round. Matches `PswapNoteAttachment::depth()`.
     pub current_depth: u32,
-    /// Offered-asset balance still unfilled (same faucet as
-    /// `original_pswap.offered_asset()`; SQL stores just the amount).
     pub remaining_offered: FungibleAsset,
-    /// Requested-asset balance still unfilled.
     pub remaining_requested: FungibleAsset,
-
     pub state: PswapLineageState,
-    /// Block the original PSWAP was submitted in.
     pub created_at_block: BlockNumber,
-    /// Block of the most recent state-mutating round.
     pub updated_at_block: BlockNumber,
 }
 
@@ -173,19 +166,18 @@ pub fn build_record_from_columns(
     updated_at_block: BlockNumber,
 ) -> Result<PswapLineageRecord, PswapLineageError> {
     // Faucets live on `original_pswap` (chain-invariant); SQL stores only amounts.
-    let to_asset =
-        |raw: u64, faucet: AccountId, field: &'static str| -> Result<FungibleAsset, PswapLineageError> {
-            FungibleAsset::new(faucet, raw).map_err(|err| {
-                PswapLineageError::InconsistentRow(format!(
-                    "{field} = {raw} (faucet {faucet}) failed FungibleAsset construction: {err}"
-                ))
-            })
-        };
     let offered_faucet = original_pswap.offered_asset().faucet_id();
     let requested_faucet = original_pswap.storage().requested_asset().faucet_id();
-    let remaining_offered = to_asset(remaining_offered, offered_faucet, "remaining_offered")?;
-    let remaining_requested =
-        to_asset(remaining_requested, requested_faucet, "remaining_requested")?;
+    let remaining_offered = FungibleAsset::new(offered_faucet, remaining_offered).map_err(|err| {
+        PswapLineageError::InconsistentRow(format!(
+            "remaining_offered = {remaining_offered} (faucet {offered_faucet}) failed FungibleAsset construction: {err}"
+        ))
+    })?;
+    let remaining_requested = FungibleAsset::new(requested_faucet, remaining_requested).map_err(|err| {
+        PswapLineageError::InconsistentRow(format!(
+            "remaining_requested = {remaining_requested} (faucet {requested_faucet}) failed FungibleAsset construction: {err}"
+        ))
+    })?;
 
     Ok(PswapLineageRecord {
         original_pswap,

@@ -489,10 +489,7 @@ where
 
         // Fire transaction observers. Per-observer failures are logged.
         for observer in &self.transaction_observers {
-            if let Err(err) =
-                <dyn TransactionObserver>::observe(observer.as_ref(), tx_result, submission_height)
-                    .await
-            {
+            if let Err(err) = observer.observe(tx_result, submission_height).await {
                 tracing::warn!(
                     observer = observer.name(),
                     error = ?err,

@@ -36,10 +36,7 @@ use crate::sync::StateSyncUpdate;
 // -----------------------------------------------------------------------------
 
 /// Returns one [`PswapLineageRoundUpdate`] per round advanced this sync.
-/// For each active lineage whose tip nullifier is in the consumed-window,
-/// looks up the round's notes by `(order_id, depth)`, classifies them by
-/// tag, and builds the round update. Inner loop catches same-block
-/// multi-fill via in-memory advancement.
+/// Inner loop catches same-block multi-fill via in-memory advancement.
 pub async fn discover_pswap_rounds(
     store: Arc<dyn Store>,
     state_sync_update: &StateSyncUpdate,
@@ -125,8 +122,7 @@ fn build_round_update(
     let requested_faucet = original.storage().requested_asset().faucet_id();
     let zero_offered = FungibleAsset::new(offered_faucet, 0).expect("FA(_, 0) is always valid");
     let zero_requested = FungibleAsset::new(requested_faucet, 0).expect("FA(_, 0) is always valid");
-    // Payback amounts live in the requested faucet (fill); remainder amounts
-    // in the offered faucet (payout).
+    // payback → requested faucet (fill); remainder → offered faucet (payout).
     let to_fill = |amount: AssetAmount| FungibleAsset::new(requested_faucet, u64::from(amount));
     let to_payout = |amount: AssetAmount| FungibleAsset::new(offered_faucet, u64::from(amount));
 
@@ -210,8 +206,6 @@ fn build_round_update(
                     remaining_requested.amount(),
                 )
                 .map_err(PswapLineageError::Reconstruction)?;
-            // Phase 1: no id-match verification (see `reconstruct_payback`).
-
             Ok(Some(PswapLineageRoundUpdate {
                 order_id: lineage.order_id(),
                 round_depth,
@@ -233,9 +227,7 @@ fn build_round_update(
     }
 }
 
-/// Reconstructs the payback note. Phase 1 does NOT verify the
-/// reconstructed id matches the on-chain id — phase 2 hardening can add
-/// that defence against malicious-node tampering.
+/// Reconstructs the payback note. No id-match verification (phase 2 task).
 fn reconstruct_payback(
     original: &PswapNote,
     note_update: &PswapChainNoteUpdate,
@@ -253,9 +245,7 @@ fn reconstruct_payback(
 // -----------------------------------------------------------------------------
 
 impl PswapLineageRecord {
-    /// Applies an update in memory (returns the post-round version).
-    /// Used by the same-block multi-fill loop to advance through several
-    /// rounds without writing to the store between them.
+    /// Returns the post-round version. Drives the same-block multi-fill loop.
     pub(crate) fn apply_round_in_memory(
         mut self,
         update: &PswapLineageRoundUpdate,
@@ -278,9 +268,7 @@ impl PswapLineageRecord {
 
 #[cfg(test)]
 mod tests {
-    //! Correlator tests — exercise `build_round_update` + the in-memory
-    //! multi-fill advance directly. Chain note updates use real
-    //! `PswapNote::payback_note` / `remainder_note` reconstructions.
+    //! Correlator tests — exercise `build_round_update` + multi-fill advance.
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -294,10 +282,7 @@ mod tests {
     use super::super::lineage::test_helpers::{build_test_pswap, fixed_account_ids};
     use super::*;
 
-    /// Builds a typed `PswapNoteAttachment` from raw test inputs, using
-    /// the canonical `order_id` from the PSWAP under test. Centralises
-    /// the `u64 -> AssetAmount` + `u64 -> u32` conversions so call sites
-    /// stay terse:  `pswap_attachment(&pswap, depth, amount)`.
+    /// `PswapNoteAttachment` from raw u64s, keyed off the PSWAP's order_id.
     fn pswap_attachment(pswap: &PswapNote, depth: u32, amount: u64) -> PswapNoteAttachment {
         PswapNoteAttachment::new(
             AssetAmount::new(amount).expect("amount fits in AssetAmount"),
@@ -309,10 +294,7 @@ mod tests {
         AssetAmount::new(v).expect("amount fits in AssetAmount")
     }
 
-    /// Minimum-valid inclusion proof. The discovery correlator never
-    /// inspects the proof's Merkle path; it only threads the value to
-    /// the eventual store insert. An empty path at depth 0 is the
-    /// cheapest valid construction.
+    /// Minimum-valid inclusion proof — correlator never inspects the path.
     fn dummy_inclusion_proof(block: u32) -> NoteInclusionProof {
         let path = SparseMerklePath::from_parts(0, Vec::new())
             .expect("empty SparseMerklePath is valid");
@@ -320,8 +302,7 @@ mod tests {
             .expect("zero index is well below the per-block notes ceiling")
     }
 
-    /// Builds an initial `Active` lineage record at depth 0 from a
-    /// freshly-built test PSWAP.
+    /// Active lineage at depth 0 built from a fresh test PSWAP.
     fn initial_record(pswap: PswapNote, offered: u64, requested: u64) -> PswapLineageRecord {
         let note = Note::from(pswap.clone());
         let offered_faucet = pswap.offered_asset().faucet_id();
@@ -340,12 +321,8 @@ mod tests {
         }
     }
 
-    /// Constructs a `PswapChainNoteUpdate` whose `note_id` matches the
-    /// given on-chain note. Tests build the candidate notes via the
-    /// protocol's reconstruction helpers (`payback_note` / `remainder_note`),
-    /// then wrap them with this so the correlator's id-match check passes.
-    /// `tag` is taken from the note's metadata so the correlator's tag-based
-    /// payback/remainder differentiation matches reality.
+    /// `PswapChainNoteUpdate` mirroring `note` (id + tag) so the
+    /// correlator's tag-based payback/remainder split works.
     fn chain_update_from(
         note: &Note,
         order_id: Felt,
@@ -366,14 +343,11 @@ mod tests {
         }
     }
 
-    /// 2-candidate partial fill: advances the lineage by one round to
-    /// `Active`, subtracts the round amounts from `remaining_*`, and
-    /// reconstructs both payback and remainder.
+    /// 2-candidate partial fill → `Active`, both `remaining_*` reduced.
     #[test]
     fn build_round_update_partial_fill_advances_active() {
         let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        // Pick a deliberately-distinct consumer so we can assert it
-        // round-trips through `consumer_account_id` correctly.
+        // Distinct consumer asserts round-trip through `consumer_account_id`.
         let consumer = AccountId::try_from(
             miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
         )
@@ -423,8 +397,7 @@ mod tests {
         assert!(update.payback_inclusion_proof.is_some());
     }
 
-    /// 1-candidate full fill: terminal `FullyFilled`, both `remaining_*`
-    /// zero, no new tip, no remainder.
+    /// 1-candidate full fill → `FullyFilled`, no remainder, both zeros.
     #[test]
     fn build_round_update_full_fill_marks_fully_filled() {
         let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
@@ -459,10 +432,8 @@ mod tests {
         assert!(update.remainder.is_none());
     }
 
-    /// 0-candidate consumption: terminal `Reclaimed` with
-    /// `consumer_account_id == creator` and BOTH `remaining_*` zeroed —
-    /// the regression guard for the bug where `remaining_requested`
-    /// retained its pre-reclaim value.
+    /// 0-candidate consumption → `Reclaimed`, consumer == creator, both
+    /// `remaining_*` zeroed. Regression guard.
     #[test]
     fn build_round_update_zero_outputs_marks_reclaimed_with_remaining_zero() {
         let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
@@ -487,21 +458,15 @@ mod tests {
         assert_eq!(update.fill_amount.amount(), AssetAmount::ZERO);
         assert_eq!(update.payout_amount.amount(), asset_amount(80));
         assert_eq!(update.remaining_offered.amount(), AssetAmount::ZERO);
-        // Regression: the reclaim branch used to write
-        // `current.remaining_requested` here, leaving the terminal row
-        // with a non-zero `remaining_requested`. The doc on
-        // `PswapLineageRoundUpdate::remaining_requested` says "0 on
-        // full fill / reclaim", and this assert holds the line.
+        // Regression: reclaim used to leak the pre-reclaim
+        // `remaining_requested` into the terminal row.
         assert_eq!(update.remaining_requested.amount(), AssetAmount::ZERO);
         assert!(update.payback.is_none());
         assert!(update.payback_inclusion_proof.is_none());
     }
 
-    /// Same-block multi-fill: round 1 advances the lineage in memory;
-    /// round 2 is then built against the post-round-1 record. The two
-    /// round updates emitted should chain correctly — round 2's
-    /// `previous remaining_*` equal round 1's `new_remaining_*`, and
-    /// the second consumer sees the in-memory-advanced tip.
+    /// Same-block multi-fill: round 2 must build against round 1's
+    /// in-memory-advanced lineage, not the original.
     #[test]
     fn apply_round_in_memory_chains_correctly_for_multi_fill() {
         let (_sender, _creator, offered_faucet, requested_faucet) = fixed_account_ids();
@@ -535,7 +500,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-        // Apply in-memory — exactly what `discover_pswap_rounds`'s loop does.
+        // Mirrors `discover_pswap_rounds`'s inner loop.
         let record1 = record0.apply_round_in_memory(&update1);
         assert_eq!(record1.current_depth, 1);
         assert_eq!(record1.remaining_offered.amount(), asset_amount(new_off1));
@@ -559,12 +524,8 @@ mod tests {
         assert_eq!(update2.remaining_offered.amount(), AssetAmount::ZERO);
         assert_eq!(update2.remaining_requested.amount(), AssetAmount::ZERO);
 
-        // The chain invariant is the whole point of this test: round 2
-        // consumed the remainder produced by round 1, not the original.
         let record2 = record1.apply_round_in_memory(&update2);
         assert_eq!(record2.state, PswapLineageState::FullyFilled);
-        // Same-block multi-fill: both round updates are emitted in
-        // order, exactly two of them.
         let emitted = vec![update1, update2];
         assert_eq!(emitted.len(), 2);
     }

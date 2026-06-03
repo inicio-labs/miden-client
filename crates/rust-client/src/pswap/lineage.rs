@@ -134,39 +134,28 @@ impl PswapLineageRecord {
 // PSWAP LINEAGE ROUND UPDATE
 // ================================================================================================
 
-/// One round's transition, produced by `discover_pswap_rounds` and applied
-/// atomically by `Store::apply_pswap_round`. Fill = payback + remainder
-/// (≤1 each); reclaim = no outputs.
+/// One round's transition. Fill = payback + remainder (≤1 each); reclaim
+/// = no outputs. Applied atomically by `Store::apply_pswap_round`.
 #[derive(Debug, Clone)]
 pub struct PswapLineageRoundUpdate {
     pub order_id: Felt,
-    /// `previous_depth + 1`.
     pub round_depth: u32,
-    /// The consumer of the previous tip (creator for a reclaim).
+    /// Previous-tip consumer (creator on reclaim).
     pub consumer_account_id: AccountId,
-    /// Filled this round, in the requested faucet.
     pub fill_amount: FungibleAsset,
-    /// Paid out this round, in the offered faucet.
     pub payout_amount: FungibleAsset,
-    /// AFTER this round.
+    // Post-round state — all fields below describe the lineage AFTER this round.
     pub remaining_offered: FungibleAsset,
-    /// AFTER this round.
     pub remaining_requested: FungibleAsset,
-    /// State AFTER this round.
     pub state: PswapLineageState,
-    /// New tip (remainder). `None` for terminal rounds.
+    /// New tip; `None` for terminal rounds.
     pub tip_note_id: Option<NoteId>,
-    /// Block the previous tip was consumed in.
     pub at_block: BlockNumber,
-    /// Reconstructed payback; inserted into `input_notes` by the store.
-    /// `None` only on reclaim.
+    /// Reconstructed payback. `None` only on reclaim.
     pub payback: Option<Note>,
-    /// Inclusion proof for `payback` — lets the store insert it as
-    /// `Unverified` (carries the proof). `None` iff `payback.is_none()`.
+    /// `None` iff `payback.is_none()`.
     pub payback_inclusion_proof: Option<NoteInclusionProof>,
-    /// Reconstructed remainder; inserted into `input_notes` so its
-    /// nullifier is tracked for round N+1 detection. `None` for terminal
-    /// rounds.
+    /// Reconstructed remainder. `None` on terminal rounds.
     pub remainder: Option<Note>,
     /// `None` iff `remainder.is_none()`.
     pub remainder_inclusion_proof: Option<NoteInclusionProof>,
@@ -191,11 +180,8 @@ pub enum PswapLineageFilter {
 // SERDE HELPERS
 // ================================================================================================
 
-/// Builds a [`PswapLineageRecord`] from the column-level data the SQLite
-/// backend reads back, validating the discriminants.
-///
-/// Kept in the rust-client crate (rather than the SQLite store crate) so
-/// alternative backends can reuse the parsing logic.
+/// Builds a [`PswapLineageRecord`] from raw column data. Lives here (not
+/// in the SQLite crate) so alternative backends can reuse it.
 pub fn build_record_from_columns(
     original_pswap: PswapNote,
     current_tip_note_id: NoteId,
@@ -206,9 +192,7 @@ pub fn build_record_from_columns(
     created_at_block: BlockNumber,
     updated_at_block: BlockNumber,
 ) -> Result<PswapLineageRecord, PswapLineageError> {
-    // Combine the persisted u64 amounts with the faucets from `original_pswap`
-    // to build typed `FungibleAsset`s. The faucets are invariant across the
-    // chain's lifetime, so storing them per-row would be redundant.
+    // Faucets live on `original_pswap` (chain-invariant); SQL stores only amounts.
     let to_asset =
         |raw: u64, faucet: AccountId, field: &'static str| -> Result<FungibleAsset, PswapLineageError> {
             FungibleAsset::new(faucet, raw).map_err(|err| {
@@ -237,9 +221,7 @@ pub fn build_record_from_columns(
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    //! Small synthetic-PSWAP factory shared by the lineage / observer /
-    //! discovery / store tests. Kept in `pub(crate)` so each module can
-    //! import without re-deriving the boilerplate.
+    //! Synthetic-PSWAP factory shared across lineage / discovery / store tests.
 
     use miden_protocol::Word;
     use miden_protocol::account::AccountId;

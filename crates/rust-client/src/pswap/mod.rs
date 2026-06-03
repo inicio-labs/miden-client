@@ -42,15 +42,9 @@ use crate::Client;
 // PSWAP TRANSACTION OBSERVER
 // ================================================================================================
 
-/// [`TransactionObserver`] that registers a [`PswapLineageRecord`] +
-/// asset-pair tag subscription for every PSWAP this wallet just created
-/// (any output where `PswapNote::try_from` succeeds AND `parent_depth == 0`).
-///
-/// Tracks regardless of the PSWAP's `creator_account_id` — service-style
-/// wallets that submit PSWAPs on behalf of remote clients get chain
-/// visibility. Reclaim surfaces `CreatorNotLocal` later if applicable.
-/// Idempotent on the store side (upsert by `order_id` + `(tag, source)`
-/// insert).
+/// Registers a [`PswapLineageRecord`] + asset-pair tag subscription for
+/// every depth-0 PSWAP this wallet emits. Creator-agnostic (service
+/// wallets are tracked too; reclaim surfaces `CreatorNotLocal` later).
 pub struct PswapTransactionObserver {
     store: Arc<dyn Store>,
 }
@@ -79,8 +73,7 @@ impl TransactionObserver for PswapTransactionObserver {
                 continue;
             };
 
-            // Skip remainders we emitted while filling someone else's PSWAP —
-            // those belong to that chain's creator, not us.
+            // Remainders we emitted filling someone else's order — skip.
             if pswap.parent_depth() != 0 {
                 continue;
             }
@@ -160,13 +153,8 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
         self.store.get_pswap_lineage(order_id).await.map_err(Into::into)
     }
 
-    /// Builds a tx that reclaims the unfilled offered asset on the current
-    /// tip of an Active lineage.
-    ///
-    /// Errors: [`PswapLineageError::NotFound`], [`NotActive`],
-    /// [`CreatorNotLocal`] (reclaim needs creator's signing authority),
-    /// or [`TipMissing`] (tip note isn't in `output_notes`/`input_notes`
-    /// — sync regression).
+    /// Builds a tx reclaiming the unfilled offered asset on the current
+    /// tip of an Active lineage. See [`PswapLineageError`] for failure modes.
     pub async fn build_pswap_cancel_by_order(
         &self,
         order_id: Felt,
@@ -181,8 +169,7 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             return Err(PswapLineageError::NotActive(lineage.state).into());
         }
 
-        // Reclaim requires the creator's signing authority. Fail loud here
-        // rather than deferring to an opaque signing failure.
+        // Fail loud now — opaque signing failure later is worse.
         let creator = lineage.creator_account_id();
         let local_accounts: BTreeSet<_> =
             self.store.get_account_ids().await?.into_iter().collect();
@@ -190,8 +177,7 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             return Err(PswapLineageError::CreatorNotLocal(creator).into());
         }
 
-        // Depth 0 tip lives in `output_notes` (we minted it); depth > 0 in
-        // `input_notes` (inserted by `apply_pswap_round`).
+        // Depth 0 tip → output_notes (we minted it); depth > 0 → input_notes.
         let tip_note: Note = if lineage.current_depth == 0 {
             let record = self
                 .store

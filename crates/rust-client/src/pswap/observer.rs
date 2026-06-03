@@ -46,9 +46,8 @@ pub struct PswapChainNoteUpdate {
 // PENDING PSWAP NOTE
 // ================================================================================================
 
-/// Per-sync queue entry — metadata-derivable fields only. The attachment
-/// content word is fetched in `apply()` via `GetNotesById` (TEMP — see
-/// upstream PR #2214).
+/// Per-sync queue entry. Attachment word is fetched in `apply()` via
+/// `GetNotesById` (TEMP — see upstream PR #2214).
 #[derive(Debug, Clone)]
 struct PendingPswapNote {
     note_id: NoteId,
@@ -118,17 +117,15 @@ impl NoteObserver for PswapChainObserver {
         Ok(())
     }
 
-    /// Fetches attachments via one batched `GetNotesById`, runs the
-    /// correlator, applies each round update. Per-round failures are
-    /// logged; one corrupted lineage does not stall the rest.
+    /// Batches `GetNotesById`, runs the correlator, applies round
+    /// updates. Per-round failures are logged, not propagated.
     async fn apply(
         &self,
         sync_update: &crate::sync::StateSyncUpdate,
     ) -> Result<(), ClientError> {
         let pending = core::mem::take(&mut *self.pending_pswap_notes.write());
 
-        // Fast path: no observed PSWAP notes AND no tracked-note consumptions
-        // — nothing for the correlator to do.
+        // Nothing observed AND nothing consumed — correlator has no work.
         if pending.is_empty()
             && sync_update.note_updates.consumed_note_ids().next().is_none()
         {
@@ -163,10 +160,8 @@ impl NoteObserver for PswapChainObserver {
 }
 
 impl PswapChainObserver {
-    /// Batched `GetNotesById` → extract attachments → return all PSWAP-
-    /// attachment chain notes. Filtering to *our* active lineages happens
-    /// in `discovery` (it already loads them and walks by `(order_id,
-    /// depth)`, so foreign-order notes are naturally ignored).
+    /// Batched `GetNotesById` → extract attachment fields. Foreign-order
+    /// filtering happens later in `discovery`.
     async fn build_chain_note_updates(
         &self,
         pending: Vec<PendingPswapNote>,
@@ -201,13 +196,9 @@ impl PswapChainObserver {
 // HELPERS
 // ---------------------------------------------------------------------------
 
-/// Extracts `(order_id, depth, amount)` from a PSWAP attachment word
-/// `[amount, order_id, depth, 0]`. Returns `None` if no PSWAP attachment,
-/// empty content, or amount/depth outside typed bounds.
-///
-/// **TEMP-PROTOCOL-ADAPTER**: only path that reads attachment content for
-/// private notes today. Replaced once upstream PR #2214 puts attachments
-/// on the `StateSyncUpdate`.
+/// Extracts `(order_id, depth, amount)` from attachment word
+/// `[amount, order_id, depth, 0]`. **TEMP** — replaced once PR #2214
+/// ships attachments inline on `StateSyncUpdate`.
 fn extract_pswap_attachment(fetched_note: &FetchedNote) -> Option<(Felt, u32, AssetAmount)> {
     let attachments = match fetched_note {
         FetchedNote::Private(_, _, _, attachments) => attachments,

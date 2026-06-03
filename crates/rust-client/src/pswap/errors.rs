@@ -21,7 +21,9 @@ pub enum PswapLineageError {
 
     /// The lineage's creator is not a local account — reclaim requires
     /// the creator's signing authority.
-    #[error("PSWAP creator account {0} is not local; reclaim requires the creator's signing authority")]
+    #[error(
+        "PSWAP creator account {0} is not local; reclaim requires the creator's signing authority"
+    )]
     CreatorNotLocal(AccountId),
 
     /// The current tip is missing from the store — `pswap_lineages` is
@@ -33,7 +35,7 @@ pub enum PswapLineageError {
     #[error("PSWAP note reconstruction failed: {0}")]
     Reconstruction(#[source] NoteError),
 
-    /// SQLite read a `state` byte with no matching [`PswapLineageState`] variant.
+    /// `SQLite` read a `state` byte with no matching [`PswapLineageState`] variant.
     #[error("unknown PSWAP lineage state byte: {0}")]
     UnknownState(u8),
 

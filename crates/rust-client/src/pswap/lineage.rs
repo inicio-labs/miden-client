@@ -125,14 +125,13 @@ pub struct PswapLineageRoundUpdate {
     /// New tip; `None` for terminal rounds.
     pub tip_note_id: Option<NoteId>,
     pub at_block: BlockNumber,
-    /// Reconstructed payback. `None` only on reclaim.
-    pub payback: Option<Note>,
-    /// `None` iff `payback.is_none()`.
-    pub payback_inclusion_proof: Option<NoteInclusionProof>,
-    /// Reconstructed remainder. `None` on terminal rounds.
-    pub remainder: Option<Note>,
-    /// `None` iff `remainder.is_none()`.
-    pub remainder_inclusion_proof: Option<NoteInclusionProof>,
+    /// Reconstructed payback and its inclusion proof. `None` only on
+    /// reclaim. The note and proof are always observed together in the
+    /// same sync window, so they live or die as a pair.
+    pub payback: Option<(Note, NoteInclusionProof)>,
+    /// Reconstructed remainder and its inclusion proof. `None` on terminal
+    /// rounds (full fill / reclaim). Paired for the same reason as `payback`.
+    pub remainder: Option<(Note, NoteInclusionProof)>,
 }
 
 // PSWAP LINEAGE FILTER
@@ -154,7 +153,7 @@ pub enum PswapLineageFilter {
 // ================================================================================================
 
 /// Builds a [`PswapLineageRecord`] from raw column data. Lives here (not
-/// in the SQLite crate) so alternative backends can reuse it.
+/// in the `SQLite` crate) so alternative backends can reuse it.
 pub fn build_record_from_columns(
     original_pswap: PswapNote,
     current_tip_note_id: NoteId,
@@ -208,7 +207,7 @@ pub(crate) mod test_helpers {
     use miden_standards::note::{PswapNote, PswapNoteStorage};
 
     /// Returns `(sender, creator, offered_faucet, requested_faucet)` —
-    /// four distinct testing AccountIds chosen to satisfy PSWAP's
+    /// four distinct testing `AccountId`s chosen to satisfy PSWAP's
     /// faucet-distinctness invariant.
     pub fn fixed_account_ids() -> (AccountId, AccountId, AccountId, AccountId) {
         (
@@ -273,9 +272,11 @@ mod tests {
     /// against a future renumbering breaking the on-disk format.
     #[test]
     fn state_try_from_u8_round_trips_known_variants() {
-        for state in
-            [PswapLineageState::Active, PswapLineageState::FullyFilled, PswapLineageState::Reclaimed]
-        {
+        for state in [
+            PswapLineageState::Active,
+            PswapLineageState::FullyFilled,
+            PswapLineageState::Reclaimed,
+        ] {
             assert_eq!(PswapLineageState::try_from_u8(state.as_u8()).unwrap(), state);
         }
     }
@@ -294,8 +295,7 @@ mod tests {
     #[test]
     fn build_record_from_columns_accepts_valid_depth_zero_row() {
         let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let pswap =
-            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let pswap = build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
         let initial_note_id = miden_protocol::note::Note::from(pswap.clone()).id();
 
         let record = build_record_from_columns(
@@ -320,8 +320,7 @@ mod tests {
     #[test]
     fn build_record_from_columns_accepts_valid_advanced_row() {
         let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let pswap =
-            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let pswap = build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
         let note = miden_protocol::note::Note::from(pswap.clone());
         let record = build_record_from_columns(
             pswap,
@@ -343,8 +342,7 @@ mod tests {
     #[test]
     fn build_record_from_columns_rejects_unknown_state() {
         let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let pswap =
-            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let pswap = build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
         let note = miden_protocol::note::Note::from(pswap.clone());
         match build_record_from_columns(
             pswap,
@@ -368,20 +366,18 @@ mod tests {
     #[test]
     fn accessors_delegate_to_stored_pswap_note() {
         let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let pswap =
-            build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
+        let pswap = build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
 
         let expected_order_id = pswap.order_id();
-        let expected_tag =
-            miden_standards::note::PswapNote::create_tag(
-                pswap.note_type(),
-                pswap.offered_asset(),
-                pswap.storage().requested_asset(),
-            );
+        let expected_tag = miden_standards::note::PswapNote::create_tag(
+            pswap.note_type(),
+            pswap.offered_asset(),
+            pswap.storage().requested_asset(),
+        );
 
         let note = miden_protocol::note::Note::from(pswap.clone());
-        let remaining_offered = pswap.offered_asset().clone();
-        let remaining_requested = pswap.storage().requested_asset().clone();
+        let remaining_offered = *pswap.offered_asset();
+        let remaining_requested = *pswap.storage().requested_asset();
         let record = PswapLineageRecord {
             original_pswap: pswap,
             current_tip_note_id: note.id(),
@@ -398,4 +394,3 @@ mod tests {
         assert_eq!(record.creator_account_id(), creator);
     }
 }
-

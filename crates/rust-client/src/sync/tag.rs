@@ -146,6 +146,33 @@ impl Deserializable for NoteTagSource {
     }
 }
 
+impl PartialEq<NoteTag> for NoteTagRecord {
+    fn eq(&self, other: &NoteTag) -> bool {
+        self.tag == *other
+    }
+}
+
+impl From<&Account> for NoteTagRecord {
+    fn from(account: &Account) -> Self {
+        NoteTagRecord::with_account_source(NoteTag::with_account_target(account.id()), account.id())
+    }
+}
+
+impl TryInto<NoteTagRecord> for &InputNoteRecord {
+    type Error = NoteRecordError;
+
+    fn try_into(self) -> Result<NoteTagRecord, Self::Error> {
+        match self.metadata() {
+            Some(metadata) => {
+                Ok(NoteTagRecord::with_note_source(metadata.tag(), self.details_commitment()))
+            },
+            None => Err(NoteRecordError::ConversionError(
+                "Input Note Record does not contain tag".to_string(),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tag_source_tests {
     use miden_protocol::Word;
@@ -189,13 +216,13 @@ mod tag_source_tests {
     #[test]
     fn note_tag_source_round_trip_every_variant() {
         let account_id =
-            miden_protocol::account::AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
-        let details_commitment =
-            miden_protocol::note::NoteDetailsCommitment::from_raw_commitments(
-                miden_protocol::Word::empty(),
-                miden_protocol::Word::empty(),
-            );
-        let subscription_key = note_id_from_u64(0xDEAD_BEEF_DEAD_BEEF);
+            miden_protocol::account::AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET)
+                .unwrap();
+        let details_commitment = miden_protocol::note::NoteDetailsCommitment::from_raw_commitments(
+            miden_protocol::Word::empty(),
+            miden_protocol::Word::empty(),
+        );
+        let subscription_key = note_id_from_u64(0xdead_beef_dead_beef);
 
         let variants = [
             NoteTagSource::Account(account_id),
@@ -218,32 +245,5 @@ mod tag_source_tests {
     fn note_tag_source_unknown_discriminant_errors() {
         let bogus = [99u8];
         assert!(NoteTagSource::read_from_bytes(&bogus).is_err());
-    }
-}
-
-impl PartialEq<NoteTag> for NoteTagRecord {
-    fn eq(&self, other: &NoteTag) -> bool {
-        self.tag == *other
-    }
-}
-
-impl From<&Account> for NoteTagRecord {
-    fn from(account: &Account) -> Self {
-        NoteTagRecord::with_account_source(NoteTag::with_account_target(account.id()), account.id())
-    }
-}
-
-impl TryInto<NoteTagRecord> for &InputNoteRecord {
-    type Error = NoteRecordError;
-
-    fn try_into(self) -> Result<NoteTagRecord, Self::Error> {
-        match self.metadata() {
-            Some(metadata) => {
-                Ok(NoteTagRecord::with_note_source(metadata.tag(), self.details_commitment()))
-            },
-            None => Err(NoteRecordError::ConversionError(
-                "Input Note Record does not contain tag".to_string(),
-            )),
-        }
     }
 }

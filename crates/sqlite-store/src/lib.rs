@@ -572,7 +572,7 @@ impl Store for SqliteStore {
         record: &miden_client::pswap::PswapLineageRecord,
     ) -> Result<(), StoreError> {
         let record = record.clone();
-        self.interact_with_connection(move |conn| SqliteStore::upsert_pswap_lineage(conn, record))
+        self.interact_with_connection(move |conn| SqliteStore::upsert_pswap_lineage(conn, &record))
             .await
     }
 
@@ -595,14 +595,13 @@ impl Store for SqliteStore {
             _ => None,
         };
         let rows = self
-            .interact_with_connection(move |conn| SqliteStore::list_pswap_lineages(conn, filter))
+            .interact_with_connection(move |conn| SqliteStore::list_pswap_lineages(conn, &filter))
             .await?;
         Ok(match by_creator {
             None => rows,
-            Some(account_id) => rows
-                .into_iter()
-                .filter(|r| r.creator_account_id() == account_id)
-                .collect(),
+            Some(account_id) => {
+                rows.into_iter().filter(|r| r.creator_account_id() == account_id).collect()
+            },
         })
     }
 
@@ -611,7 +610,7 @@ impl Store for SqliteStore {
         update: &miden_client::pswap::PswapLineageRoundUpdate,
     ) -> Result<(), StoreError> {
         let update = update.clone();
-        self.interact_with_connection(move |conn| SqliteStore::apply_pswap_round(conn, update))
+        self.interact_with_connection(move |conn| SqliteStore::apply_pswap_round(conn, &update))
             .await
     }
 }

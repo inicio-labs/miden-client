@@ -340,9 +340,7 @@ impl NoteUpdateTracker {
         let input = self.input_notes.iter().filter_map(|(note_id, update)| {
             if !matches!(
                 update.update_type,
-                NoteUpdateType::Insert
-                    | NoteUpdateType::Update
-                    | NoteUpdateType::InsertCommitted
+                NoteUpdateType::Insert | NoteUpdateType::Update | NoteUpdateType::InsertCommitted
             ) {
                 return None;
             }

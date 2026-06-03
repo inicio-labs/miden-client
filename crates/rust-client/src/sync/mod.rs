@@ -134,9 +134,9 @@ where
         let state_sync =
             StateSync::new(self.rpc_api.clone(), Arc::new(note_screener), self.tx_discard_delta)
                 .with_note_observer(Arc::new(PswapChainObserver::new(
-                self.store.clone(),
-                self.rpc_api.clone(),
-            )));
+                    self.store.clone(),
+                    self.rpc_api.clone(),
+                )));
         let input = self.build_sync_input().await?;
 
         let mut partial_mmr = self.get_current_partial_mmr().await?;

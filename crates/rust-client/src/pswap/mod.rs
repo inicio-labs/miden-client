@@ -3,9 +3,9 @@
 //!
 //! Flow:
 //! 1. Create → [`PswapLineageRecord`] row + asset-pair tag subscription.
-//! 2. Sync → [`PswapChainObserver`] collects PSWAP-attachment notes;
-//!    [`discover_pswap_rounds`] correlates them with tracked-note
-//!    consumption events and emits one [`PswapLineageRoundUpdate`] per round.
+//! 2. Sync → [`PswapChainObserver`] collects PSWAP-attachment notes; [`discover_pswap_rounds`]
+//!    correlates them with tracked-note consumption events and emits one
+//!    [`PswapLineageRoundUpdate`] per round.
 //! 3. Reclaim → [`Client::build_pswap_cancel_by_order`].
 //!
 //! Protocol invariants (≤1 payback + ≤1 remainder per round, attachment
@@ -18,26 +18,29 @@ pub mod lineage;
 pub mod observer;
 mod types;
 
-pub use errors::PswapLineageError;
-pub use lineage::{PswapLineageFilter, PswapLineageRecord, PswapLineageRoundUpdate, PswapLineageState};
-pub use observer::{PswapChainNoteUpdate, PswapChainObserver};
 // `PswapTransactionObserver` is defined inline below in this file.
-
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 
 use async_trait::async_trait;
+pub use errors::PswapLineageError;
+pub use lineage::{
+    PswapLineageFilter,
+    PswapLineageRecord,
+    PswapLineageRoundUpdate,
+    PswapLineageState,
+};
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::Note;
 use miden_standards::note::PswapNote;
 use miden_tx::auth::TransactionAuthenticator;
+pub use observer::{PswapChainNoteUpdate, PswapChainObserver};
 
-use crate::ClientError;
 use crate::store::Store;
 use crate::sync::{NoteTagRecord, NoteTagSource};
 use crate::transaction::{TransactionObserver, TransactionResult, notes_from_output};
-use crate::Client;
+use crate::{Client, ClientError};
 
 // PSWAP TRANSACTION OBSERVER
 // ================================================================================================
@@ -161,8 +164,7 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
 
         // Fail loud now — opaque signing failure later is worse.
         let creator = lineage.creator_account_id();
-        let local_accounts: BTreeSet<_> =
-            self.store.get_account_ids().await?.into_iter().collect();
+        let local_accounts: BTreeSet<_> = self.store.get_account_ids().await?.into_iter().collect();
         if !local_accounts.contains(&creator) {
             return Err(PswapLineageError::CreatorNotLocal(creator).into());
         }

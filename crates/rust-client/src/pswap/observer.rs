@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use miden_protocol::account::AccountId;
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{NoteId, NoteInclusionProof, NoteTag};
+use miden_protocol::note::{NoteAttachmentHeader, NoteId, NoteInclusionProof, NoteTag};
 use miden_standards::note::{PswapNote, PswapNoteAttachment};
 use tracing::warn;
 
@@ -56,10 +56,10 @@ struct PendingPswapNote {
 
 /// Per-sync collector of PSWAP-attachment notes seen this sync.
 ///
-/// - `observe()` runs per-note during sync: cheap PSWAP-scheme filter,
-///   queues a pending record (no store query, no RPC, no DB write).
-/// - `apply()` runs once post-sync: batches one `GetNotesById`, builds
-///   [`PswapChainNoteUpdate`]s, runs the correlator, applies round updates.
+/// - `observe()` runs per-note during sync: cheap PSWAP-scheme filter, queues a pending record (no
+///   store query, no RPC, no DB write).
+/// - `apply()` runs once post-sync: batches one `GetNotesById`, builds [`PswapChainNoteUpdate`]s,
+///   runs the correlator, applies round updates.
 pub struct PswapChainObserver {
     store: Arc<dyn Store>,
     /// **TEMP**: drop once upstream PR #2214 ships attachments alongside
@@ -93,7 +93,7 @@ impl NoteObserver for PswapChainObserver {
             .metadata()
             .attachment_headers()
             .first()
-            .and_then(|h| h.scheme())
+            .and_then(NoteAttachmentHeader::scheme)
             == Some(PswapNote::PSWAP_ATTACHMENT_SCHEME);
         if !is_pswap {
             return Ok(());
@@ -112,16 +112,11 @@ impl NoteObserver for PswapChainObserver {
 
     /// Batches `GetNotesById`, runs the correlator, applies round
     /// updates. Per-round failures are logged, not propagated.
-    async fn apply(
-        &self,
-        sync_update: &crate::sync::StateSyncUpdate,
-    ) -> Result<(), ClientError> {
+    async fn apply(&self, sync_update: &crate::sync::StateSyncUpdate) -> Result<(), ClientError> {
         let pending = core::mem::take(&mut *self.pending_pswap_notes.write());
 
         // Nothing observed AND nothing consumed — correlator has no work.
-        if pending.is_empty()
-            && sync_update.note_updates.consumed_note_ids().next().is_none()
-        {
+        if pending.is_empty() && sync_update.note_updates.consumed_note_ids().next().is_none() {
             return Ok(());
         }
 

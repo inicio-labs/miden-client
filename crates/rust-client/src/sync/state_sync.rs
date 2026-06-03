@@ -18,10 +18,10 @@ use miden_protocol::crypto::merkle::mmr::{MmrDelta, PartialMmr};
 use miden_protocol::note::{Note, NoteAttachments, NoteId, NoteTag, NoteType, Nullifier};
 use tracing::info;
 
-use super::NoteObserver;
 use super::state_sync_update::TransactionUpdateTracker;
 use super::{
     AccountUpdates,
+    NoteObserver,
     PartialBlockchainUpdates,
     PublicAccountDelta,
     PublicAccountUpdate,

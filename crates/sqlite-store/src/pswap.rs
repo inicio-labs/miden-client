@@ -9,13 +9,12 @@ use std::vec::Vec;
 #[cfg(test)]
 use miden_client::account::AccountId;
 use miden_client::note::{BlockNumber, Note, NoteId, PswapNote};
+use miden_client::pswap::lineage::build_record_from_columns;
 use miden_client::pswap::{
-    PswapLineageError,
     PswapLineageFilter,
     PswapLineageRecord,
     PswapLineageRoundUpdate,
     PswapLineageState,
-    lineage::build_record_from_columns,
 };
 use miden_client::store::StoreError;
 use miden_client::sync::{NoteTagRecord, NoteTagSource};
@@ -38,10 +37,10 @@ impl SqliteStore {
 
     pub(crate) fn upsert_pswap_lineage(
         conn: &mut Connection,
-        record: PswapLineageRecord,
+        record: &PswapLineageRecord,
     ) -> Result<(), StoreError> {
         let tx = conn.transaction().into_store_error()?;
-        upsert_pswap_lineage_tx(&tx, &record)?;
+        upsert_pswap_lineage_tx(&tx, record)?;
         tx.commit().into_store_error()
     }
 
@@ -62,27 +61,26 @@ impl SqliteStore {
 
     pub(crate) fn list_pswap_lineages(
         conn: &mut Connection,
-        filter: PswapLineageFilter,
+        filter: &PswapLineageFilter,
     ) -> Result<Vec<PswapLineageRecord>, StoreError> {
         // `ActiveByTipNoteIds` has a dynamic IN-list — separate path avoids
         // bloating the prepared-statement cache.
-        if let PswapLineageFilter::ActiveByTipNoteIds(note_ids) = &filter {
+        if let PswapLineageFilter::ActiveByTipNoteIds(note_ids) = filter {
             return list_active_by_tip_note_ids(conn, note_ids);
         }
 
         // `ByCreator` is filtered in Rust because the creator lives inside
         // the serialised `original_pswap` blob, not in its own column.
-        let sql_filter = sql_filter_part(&filter);
+        let sql_filter = sql_filter_part(filter);
         let full_sql = std::format!("{SELECT_LINEAGE_COLUMNS_PREFIX}{sql_filter}");
         let mut stmt = conn.prepare_cached(&full_sql).into_store_error()?;
 
-        let rows: Vec<PswapLineageRecord> = match &filter {
+        let rows: Vec<PswapLineageRecord> = match filter {
             PswapLineageFilter::All | PswapLineageFilter::ByCreator(_) => {
                 collect_rows(stmt.query([]).into_store_error()?)?
             },
             PswapLineageFilter::Active => collect_rows(
-                stmt.query(params![PswapLineageState::Active.as_u8()])
-                    .into_store_error()?,
+                stmt.query(params![PswapLineageState::Active.as_u8()]).into_store_error()?,
             )?,
             PswapLineageFilter::ActiveByTipNoteIds(_) => unreachable!("handled above"),
         };
@@ -92,41 +90,27 @@ impl SqliteStore {
 
     pub(crate) fn apply_pswap_round(
         conn: &mut Connection,
-        update: PswapLineageRoundUpdate,
+        update: &PswapLineageRoundUpdate,
     ) -> Result<(), StoreError> {
         let tx = conn.transaction().into_store_error()?;
 
         // 1. Mutate the lineage row.
-        update_lineage_tip_tx(&tx, &update)?;
+        update_lineage_tip_tx(&tx, update)?;
 
-        // 2. Insert payback + remainder into `input_notes`. See
-        //    `insert_pswap_round_note_tx` for the skip-if-present rationale.
-        //    The remainder insert ensures round-N+1 detection works for
-        //    private PSWAPs (screener can't see private content).
-        if let Some(payback_note) = &update.payback {
-            insert_pswap_round_note_tx(
-                &tx,
-                payback_note,
-                update.payback_inclusion_proof.as_ref(),
-                update.at_block,
-            )?;
+        // 2. Insert payback + remainder into `input_notes`. See `insert_pswap_round_note_tx` for
+        //    the skip-if-present rationale. The remainder insert ensures round-N+1 detection works
+        //    for private PSWAPs (screener can't see private content). Each note is observed
+        //    together with its inclusion proof in the same sync window, so they arrive paired.
+        if let Some((payback_note, inclusion_proof)) = &update.payback {
+            insert_pswap_round_note_tx(&tx, payback_note, inclusion_proof)?;
         }
-        if let Some(remainder_note) = &update.remainder {
-            insert_pswap_round_note_tx(
-                &tx,
-                remainder_note,
-                update.remainder_inclusion_proof.as_ref(),
-                update.at_block,
-            )?;
+        if let Some((remainder_note, inclusion_proof)) = &update.remainder {
+            insert_pswap_round_note_tx(&tx, remainder_note, inclusion_proof)?;
         }
 
-        // 3. Drop the asset-pair tag on terminal states (same tx — crash
-        //    between row update and tag delete would leave a terminal
-        //    lineage paying sync bandwidth).
-        if matches!(
-            update.state,
-            PswapLineageState::FullyFilled | PswapLineageState::Reclaimed
-        ) {
+        // 3. Drop the asset-pair tag on terminal states (same tx — crash between row update and tag
+        //    delete would leave a terminal lineage paying sync bandwidth).
+        if matches!(update.state, PswapLineageState::FullyFilled | PswapLineageState::Reclaimed) {
             remove_pswap_asset_pair_tag_tx(&tx, update.order_id)?;
         }
 
@@ -135,12 +119,9 @@ impl SqliteStore {
 }
 
 /// Removes the `(asset_pair_tag, Subscription(original_note_id))` row.
-/// Recomputes the tag and original NoteId from the persisted PSWAP blob
+/// Recomputes the tag and original `NoteId` from the persisted PSWAP blob
 /// (neither is carried on the round update). Idempotent.
-fn remove_pswap_asset_pair_tag_tx(
-    tx: &Transaction<'_>,
-    order_id: Felt,
-) -> Result<(), StoreError> {
+fn remove_pswap_asset_pair_tag_tx(tx: &Transaction<'_>, order_id: Felt) -> Result<(), StoreError> {
     const SQL: &str = "SELECT original_pswap FROM pswap_lineages WHERE order_id = ?";
     let blob: Option<Vec<u8>> = tx
         .prepare_cached(SQL)
@@ -152,8 +133,7 @@ fn remove_pswap_asset_pair_tag_tx(
         return Ok(());
     };
 
-    let note =
-        Note::read_from_bytes(&blob).map_err(StoreError::DataDeserializationError)?;
+    let note = Note::read_from_bytes(&blob).map_err(StoreError::DataDeserializationError)?;
     let pswap = PswapNote::try_from(&note)
         .map_err(|err| StoreError::DataDeserializationError(deser_err(err.to_string())))?;
     let tag = PswapNote::create_tag(
@@ -165,7 +145,10 @@ fn remove_pswap_asset_pair_tag_tx(
 
     remove_note_tag_tx(
         tx,
-        NoteTagRecord { tag, source: NoteTagSource::Subscription(original_note_id) },
+        NoteTagRecord {
+            tag,
+            source: NoteTagSource::Subscription(original_note_id),
+        },
     )?;
     Ok(())
 }
@@ -182,16 +165,19 @@ FROM pswap_lineages";
 
 fn sql_filter_part(filter: &PswapLineageFilter) -> &'static str {
     match filter {
-        PswapLineageFilter::All | PswapLineageFilter::ByCreator(_) => "",
         PswapLineageFilter::Active => " WHERE state = ?",
-        // ActiveByTipNoteIds builds its SQL dynamically — see
-        // list_active_by_tip_note_ids — and never routes through here.
-        PswapLineageFilter::ActiveByTipNoteIds(_) => "",
+        // `ActiveByTipNoteIds` builds its SQL dynamically in
+        // `list_active_by_tip_note_ids` and never routes through here; it
+        // shares the no-extra-clause arm only because this fn is unreachable
+        // for it.
+        PswapLineageFilter::All
+        | PswapLineageFilter::ByCreator(_)
+        | PswapLineageFilter::ActiveByTipNoteIds(_) => "",
     }
 }
 
 /// Loads `Active` lineages whose `current_tip_note_id` is in `note_ids`.
-/// SQLite's default param limit (32 766) dwarfs typical sync windows; we
+/// `SQLite`'s default param limit (32 766) dwarfs typical sync windows; we
 /// don't chunk. `prepare` (not `prepare_cached`) keeps per-N SQL out of
 /// the cache.
 fn list_active_by_tip_note_ids(
@@ -201,18 +187,14 @@ fn list_active_by_tip_note_ids(
     if note_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat("?")
-        .take(note_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = std::iter::repeat_n("?", note_ids.len()).collect::<Vec<_>>().join(",");
     let sql = std::format!(
         "{SELECT_LINEAGE_COLUMNS_PREFIX} \
          WHERE state = {state} AND current_tip_note_id IN ({placeholders})",
         state = PswapLineageState::Active.as_u8(),
     );
     let mut stmt = conn.prepare(&sql).into_store_error()?;
-    let note_id_texts: Vec<String> =
-        note_ids.iter().map(|n| n.as_word().to_string()).collect();
+    let note_id_texts: Vec<String> = note_ids.iter().map(|n| n.as_word().to_string()).collect();
     let rows = stmt
         .query(rusqlite::params_from_iter(note_id_texts.iter()))
         .into_store_error()?;
@@ -257,7 +239,7 @@ fn record_from_row(row: &Row<'_>) -> Result<PswapLineageRecord, StoreError> {
         BlockNumber::from(created_at_block),
         BlockNumber::from(updated_at_block),
     )
-    .map_err(map_pswap_err)
+    .map_err(|err| StoreError::DatabaseError(std::format!("pswap_lineage: {err}")))
 }
 
 // -------------------------------------------------------------------------------------------
@@ -299,12 +281,12 @@ fn update_lineage_tip_tx(
     tx: &Transaction<'_>,
     update: &PswapLineageRoundUpdate,
 ) -> Result<(), StoreError> {
-    let order_id_bytes = update.order_id.to_bytes();
-
     // Confirm the row exists AND enforce the monotonic-depth invariant
     // (every round must advance by exactly 1). The store is the last line
     // of defense against correlator off-by-ones / duplicate deliveries.
     const DEPTH_SQL: &str = "SELECT current_depth FROM pswap_lineages WHERE order_id = ?";
+
+    let order_id_bytes = update.order_id.to_bytes();
     let current_depth: Option<u32> = tx
         .prepare_cached(DEPTH_SQL)
         .into_store_error()?
@@ -321,52 +303,51 @@ fn update_lineage_tip_tx(
         return Err(StoreError::DatabaseError(std::format!(
             "apply_pswap_round: round_depth {} for order_id {} does not advance by 1 \
              (current_depth {}); refusing to corrupt the reconstruction chain",
-            update.round_depth, update.order_id, current_depth,
+            update.round_depth,
+            update.order_id,
+            current_depth,
         )));
     }
 
     let updated_block = update.at_block.as_u32();
 
-    let rows_changed = match update.tip_note_id {
-        Some(note_id) => {
-            // Active continuation — new tip overwrites the previous one.
-            const SQL: &str = "\
+    let rows_changed = if let Some(note_id) = update.tip_note_id {
+        // Active continuation — new tip overwrites the previous one.
+        const SQL: &str = "\
 UPDATE pswap_lineages SET \
  current_tip_note_id = ?, \
  current_depth = ?, remaining_offered = ?, remaining_requested = ?, \
  state = ?, updated_at_block = ? \
 WHERE order_id = ?";
-            tx.prepare_cached(SQL)
-                .into_store_error()?
-                .execute(params![
-                    note_id.as_word().to_string(),
-                    update.round_depth,
-                    u64::from(update.remaining_offered.amount()),
-                    u64::from(update.remaining_requested.amount()),
-                    update.state.as_u8(),
-                    updated_block,
-                    order_id_bytes,
-                ])
-                .into_store_error()?
-        },
-        None => {
-            // Terminal — keep the existing tip columns for diagnostics.
-            const SQL: &str = "\
+        tx.prepare_cached(SQL)
+            .into_store_error()?
+            .execute(params![
+                note_id.as_word().to_string(),
+                update.round_depth,
+                u64::from(update.remaining_offered.amount()),
+                u64::from(update.remaining_requested.amount()),
+                update.state.as_u8(),
+                updated_block,
+                order_id_bytes,
+            ])
+            .into_store_error()?
+    } else {
+        // Terminal — keep the existing tip columns for diagnostics.
+        const SQL: &str = "\
 UPDATE pswap_lineages SET \
  remaining_offered = ?, remaining_requested = ?, \
  state = ?, updated_at_block = ? \
 WHERE order_id = ?";
-            tx.prepare_cached(SQL)
-                .into_store_error()?
-                .execute(params![
-                    u64::from(update.remaining_offered.amount()),
-                    u64::from(update.remaining_requested.amount()),
-                    update.state.as_u8(),
-                    updated_block,
-                    order_id_bytes,
-                ])
-                .into_store_error()?
-        },
+        tx.prepare_cached(SQL)
+            .into_store_error()?
+            .execute(params![
+                u64::from(update.remaining_offered.amount()),
+                u64::from(update.remaining_requested.amount()),
+                update.state.as_u8(),
+                updated_block,
+                order_id_bytes,
+            ])
+            .into_store_error()?
     };
 
     if rows_changed == 0 {
@@ -383,17 +364,22 @@ WHERE order_id = ?";
 /// if a row for the same `note_id` already exists — for public notes the
 /// screener has already inserted a `Committed` row that's richer than
 /// ours; for private notes this is the only insertion site.
+///
+/// The inclusion proof is always available: a reconstructed note and its
+/// proof are observed together in the same sync window. The note lands as
+/// `Unverified`, which sync's state-promotion path turns into `Committed`
+/// on the next run.
 fn insert_pswap_round_note_tx(
     tx: &Transaction<'_>,
     note: &Note,
-    inclusion_proof: Option<&miden_client::note::NoteInclusionProof>,
-    at_block: BlockNumber,
+    inclusion_proof: &miden_client::note::NoteInclusionProof,
 ) -> Result<(), StoreError> {
     use miden_client::store::InputNoteRecord;
-    use miden_client::store::input_note_states::{ExpectedNoteState, UnverifiedNoteState};
+    use miden_client::store::input_note_states::UnverifiedNoteState;
+
+    const EXISTS_SQL: &str = "SELECT 1 FROM input_notes WHERE note_id = ?";
 
     let note_id_text = note.id().as_word().to_string();
-    const EXISTS_SQL: &str = "SELECT 1 FROM input_notes WHERE note_id = ?";
     let already_present: bool = tx
         .prepare_cached(EXISTS_SQL)
         .into_store_error()?
@@ -403,29 +389,20 @@ fn insert_pswap_round_note_tx(
         return Ok(());
     }
 
-    let metadata = note.metadata().clone();
+    let metadata = *note.metadata();
     let details = miden_client::note::NoteDetails::from(note.clone());
     let attachments = note.attachments().clone();
 
-    // `Unverified` carries the proof — sync's state-promotion path turns it
-    // into `Committed` next run. `Expected` fallback is defensive only
-    // (reclaim emits no notes, so this never runs without a proof).
-    let record = match inclusion_proof {
-        Some(proof) => InputNoteRecord::new(
-            details,
-            attachments,
-            None,
-            UnverifiedNoteState { metadata, inclusion_proof: proof.clone() }.into(),
-        ),
-        None => {
-            let state = ExpectedNoteState {
-                metadata: Some(metadata.clone()),
-                after_block_num: at_block,
-                tag: Some(metadata.tag()),
-            };
-            InputNoteRecord::new(details, attachments, None, state.into())
-        },
-    };
+    let record = InputNoteRecord::new(
+        details,
+        attachments,
+        None,
+        UnverifiedNoteState {
+            metadata,
+            inclusion_proof: inclusion_proof.clone(),
+        }
+        .into(),
+    );
     upsert_input_note_tx(tx, &record)
 }
 
@@ -433,14 +410,9 @@ fn insert_pswap_round_note_tx(
 // ERROR MAPPING
 // -------------------------------------------------------------------------------------------
 
-fn map_pswap_err(err: PswapLineageError) -> StoreError {
-    StoreError::DatabaseError(std::format!("pswap_lineage: {err}"))
-}
-
 fn deser_err(msg: String) -> DeserializationError {
     DeserializationError::InvalidValue(msg)
 }
-
 
 // =============================================================================
 // TESTS
@@ -467,14 +439,11 @@ mod tests {
     /// Standalone copy of `pswap::lineage::test_helpers` —
     /// `pub(crate)` doesn't cross crates.
     fn build_test_pswap(offered_amount: u64, requested_amount: u64) -> PswapNote {
-        let sender =
-            AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
+        let sender = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
         let creator =
             AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2).unwrap();
-        let offered_faucet =
-            AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
-        let requested_faucet =
-            AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
+        let offered_faucet = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+        let requested_faucet = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
 
         let storage = PswapNoteStorage::builder()
             .requested_asset(FungibleAsset::new(requested_faucet, requested_amount).unwrap())
@@ -497,8 +466,8 @@ mod tests {
 
     fn build_initial_record(pswap: PswapNote) -> PswapLineageRecord {
         let note = Note::from(pswap.clone());
-        let remaining_offered = pswap.offered_asset().clone();
-        let remaining_requested = pswap.storage().requested_asset().clone();
+        let remaining_offered = *pswap.offered_asset();
+        let remaining_requested = *pswap.storage().requested_asset();
         PswapLineageRecord {
             original_pswap: pswap,
             current_tip_note_id: note.id(),
@@ -511,7 +480,7 @@ mod tests {
         }
     }
 
-    /// Round-trips a record through SQLite — catches drift in the
+    /// Round-trips a record through `SQLite` — catches drift in the
     /// `Note::to_bytes` ↔ `PswapNote::try_from(&note)` serde path.
     #[tokio::test]
     async fn lineage_round_trip_via_sqlite_store() -> anyhow::Result<()> {
@@ -572,9 +541,7 @@ mod tests {
             tip_note_id: Some(record.current_tip_note_id),
             at_block: BlockNumber::from(8),
             payback: None,
-            payback_inclusion_proof: None,
             remainder: None,
-            remainder_inclusion_proof: None,
         };
         let result = store.apply_pswap_round(&bad).await;
         assert!(result.is_err(), "expected non-monotonic depth to be rejected");
@@ -596,15 +563,12 @@ mod tests {
         let store = create_test_store().await;
         let consumer =
             AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
-        let phantom_order_id = miden_protocol::Felt::new(0xDEAD_BEEF).unwrap();
+        let phantom_order_id = miden_protocol::Felt::new(0xdead_beef).unwrap();
 
         // Use arbitrary fungible-asset faucets — the unknown-order check
         // fires before the values are inspected.
-        let faucet =
-            AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
-        let fa = |amount: u64| {
-            miden_protocol::asset::FungibleAsset::new(faucet, amount).unwrap()
-        };
+        let faucet = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+        let fa = |amount: u64| miden_protocol::asset::FungibleAsset::new(faucet, amount).unwrap();
         let bogus = PswapLineageRoundUpdate {
             order_id: phantom_order_id,
             round_depth: 1,
@@ -617,47 +581,30 @@ mod tests {
             tip_note_id: None,
             at_block: BlockNumber::from(8),
             payback: None,
-            payback_inclusion_proof: None,
             remainder: None,
-            remainder_inclusion_proof: None,
         };
         let result = store.apply_pswap_round(&bogus).await;
         assert!(result.is_err(), "expected unknown order_id to be rejected");
         Ok(())
     }
 
-    /// `Active` filter excludes terminal states.
+    /// `Active` and `All` both return the single tracked row. Multi-row
+    /// state filtering needs distinct `order_id`s (distinct serial numbers),
+    /// which the shared `build_test_pswap` fixture doesn't vary; terminal-
+    /// state exclusion is covered by the observer-pipeline tests below.
     #[tokio::test]
     async fn list_pswap_lineages_filters_by_state() -> anyhow::Result<()> {
         let store = create_test_store().await;
 
-        // Two records: one with the default Active state (offered=100),
-        // one we manually mark FullyFilled (offered=999 to disambiguate
-        // by amount).
-        let mut active_rec = build_initial_record(build_test_pswap(100, 50));
-        let mut filled_rec = build_initial_record(build_test_pswap(999, 50));
-        // Force distinct order_ids via different serial numbers — both
-        // records currently share serial[1]=2, so the test depends on
-        // PswapNote's order_id() coming from serial[1]. To force a
-        // distinct order_id we have to mutate the underlying PswapNote
-        // before upserting — easiest is to construct a second PswapNote
-        // with a different serial. Since `build_test_pswap` is fixed,
-        // we adjust by emitting a NoteType::Private variant for one of
-        // them; that doesn't change serial but it changes the order_id
-        // because order_id derives from serial which is the same. So
-        // instead, we accept this limitation and only test the
-        // single-row case with the Active filter — the negative case
-        // is covered by the depth-monotonic test above.
-        let _ = &mut active_rec;
-        let _ = &mut filled_rec;
-
+        let active_rec = build_initial_record(build_test_pswap(100, 50));
         store.upsert_pswap_lineage(&active_rec).await?;
-        let listed = store.list_pswap_lineages(PswapLineageFilter::Active).await?;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].state, PswapLineageState::Active);
 
-        let listed_all = store.list_pswap_lineages(PswapLineageFilter::All).await?;
-        assert_eq!(listed_all.len(), 1, "All filter returns every row");
+        let active = store.list_pswap_lineages(PswapLineageFilter::Active).await?;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].state, PswapLineageState::Active);
+
+        let all = store.list_pswap_lineages(PswapLineageFilter::All).await?;
+        assert_eq!(all.len(), 1, "All filter returns every row");
         Ok(())
     }
 
@@ -674,8 +621,7 @@ mod tests {
 
         // Build a second PSWAP we DON'T insert — its tip serves as a
         // "not in store" sentinel.
-        let phantom_tip =
-            build_initial_record(build_test_pswap(999, 999)).current_tip_note_id;
+        let phantom_tip = build_initial_record(build_test_pswap(999, 999)).current_tip_note_id;
 
         // Empty input: no rows.
         let empty = store
@@ -726,6 +672,7 @@ mod tests {
 
     mod private_pswap_e2e {
         use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
 
         use async_trait::async_trait;
         use miden_client::account::AccountId;
@@ -739,18 +686,14 @@ mod tests {
             NoteTag,
             PswapNote,
         };
-        use miden_client::pswap::{
-            PswapChainObserver,
-            PswapLineageFilter,
-            PswapLineageState,
-        };
+        use miden_client::pswap::{PswapChainObserver, PswapLineageFilter, PswapLineageState};
         use miden_client::rpc::domain::account::AccountProof;
         use miden_client::rpc::domain::account_vault::AccountVaultInfo;
         use miden_client::rpc::domain::note::{FetchedNote, NoteSyncBlock};
-        use miden_client::rpc::domain::storage_map::StorageMapInfo;
-        use miden_client::rpc::domain::transaction::TransactionRecord;
         use miden_client::rpc::domain::nullifier::NullifierUpdate;
+        use miden_client::rpc::domain::storage_map::StorageMapInfo;
         use miden_client::rpc::domain::sync::{ChainMmrInfo, SyncTarget};
+        use miden_client::rpc::domain::transaction::TransactionRecord;
         use miden_client::rpc::{
             AccountStateAt,
             NetworkNoteStatusInfo,
@@ -777,11 +720,7 @@ mod tests {
             ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
         };
         use miden_protocol::transaction::{ProvenTransaction, TransactionInputs};
-        use miden_standards::note::{
-            PswapNoteAttachment,
-            PswapNoteStorage,
-        };
-        use std::sync::Arc;
+        use miden_standards::note::{PswapNoteAttachment, PswapNoteStorage};
 
         use crate::tests::create_test_store;
 
@@ -799,49 +738,65 @@ mod tests {
                 &self,
                 note_ids: &[NoteId],
             ) -> Result<Vec<FetchedNote>, RpcError> {
-                Ok(note_ids
-                    .iter()
-                    .filter_map(|id| self.notes_by_id.get(id).cloned())
-                    .collect())
+                Ok(note_ids.iter().filter_map(|id| self.notes_by_id.get(id).cloned()).collect())
             }
 
             // ----- The rest panics; not exercised by this test. -----
             async fn set_genesis_commitment(&self, _: Word) -> Result<(), RpcError> {
                 unimplemented!("PswapTestRpc: set_genesis_commitment")
             }
-            fn has_genesis_commitment(&self) -> Option<Word> { None }
+            fn has_genesis_commitment(&self) -> Option<Word> {
+                None
+            }
             async fn submit_proven_transaction(
-                &self, _: ProvenTransaction, _: TransactionInputs,
+                &self,
+                _: ProvenTransaction,
+                _: TransactionInputs,
             ) -> Result<BlockNumber, RpcError> {
                 unimplemented!("PswapTestRpc: submit_proven_transaction")
             }
             async fn submit_proven_batch(
-                &self, _: ProvenBatch, _: ProposedBatch, _: Vec<TransactionInputs>,
+                &self,
+                _: ProvenBatch,
+                _: ProposedBatch,
+                _: Vec<TransactionInputs>,
             ) -> Result<BlockNumber, RpcError> {
                 unimplemented!("PswapTestRpc: submit_proven_batch")
             }
             async fn get_block_header_by_number(
-                &self, _: Option<BlockNumber>, _: bool,
+                &self,
+                _: Option<BlockNumber>,
+                _: bool,
             ) -> Result<(BlockHeader, Option<MmrProof>), RpcError> {
                 unimplemented!("PswapTestRpc: get_block_header_by_number")
             }
             async fn get_block_by_number(
-                &self, _: BlockNumber, _: bool,
+                &self,
+                _: BlockNumber,
+                _: bool,
             ) -> Result<ProvenBlock, RpcError> {
                 unimplemented!("PswapTestRpc: get_block_by_number")
             }
             async fn sync_chain_mmr(
-                &self, _: BlockNumber, _: SyncTarget,
+                &self,
+                _: BlockNumber,
+                _: SyncTarget,
             ) -> Result<ChainMmrInfo, RpcError> {
                 unimplemented!("PswapTestRpc: sync_chain_mmr")
             }
             async fn sync_notes(
-                &self, _: BlockNumber, _: BlockNumber, _: &BTreeSet<NoteTag>,
+                &self,
+                _: BlockNumber,
+                _: BlockNumber,
+                _: &BTreeSet<NoteTag>,
             ) -> Result<Vec<NoteSyncBlock>, RpcError> {
                 unimplemented!("PswapTestRpc: sync_notes")
             }
             async fn sync_nullifiers(
-                &self, _: &[u16], _: BlockNumber, _: BlockNumber,
+                &self,
+                _: &[u16],
+                _: BlockNumber,
+                _: BlockNumber,
             ) -> Result<Vec<NullifierUpdate>, RpcError> {
                 unimplemented!("PswapTestRpc: sync_nullifiers")
             }
@@ -856,22 +811,32 @@ mod tests {
                 unimplemented!("PswapTestRpc: get_account_proof")
             }
             async fn get_note_script_by_root(
-                &self, _: Word,
+                &self,
+                _: Word,
             ) -> Result<Option<NoteScript>, RpcError> {
                 unimplemented!("PswapTestRpc: get_note_script_by_root")
             }
             async fn sync_storage_maps(
-                &self, _: BlockNumber, _: Option<BlockNumber>, _: AccountId,
+                &self,
+                _: BlockNumber,
+                _: Option<BlockNumber>,
+                _: AccountId,
             ) -> Result<StorageMapInfo, RpcError> {
                 unimplemented!("PswapTestRpc: sync_storage_maps")
             }
             async fn sync_account_vault(
-                &self, _: BlockNumber, _: Option<BlockNumber>, _: AccountId,
+                &self,
+                _: BlockNumber,
+                _: Option<BlockNumber>,
+                _: AccountId,
             ) -> Result<AccountVaultInfo, RpcError> {
                 unimplemented!("PswapTestRpc: sync_account_vault")
             }
             async fn sync_transactions(
-                &self, _: BlockNumber, _: BlockNumber, _: Vec<AccountId>,
+                &self,
+                _: BlockNumber,
+                _: BlockNumber,
+                _: Vec<AccountId>,
             ) -> Result<Vec<TransactionRecord>, RpcError> {
                 unimplemented!("PswapTestRpc: sync_transactions")
             }
@@ -881,7 +846,9 @@ mod tests {
             async fn get_rpc_limits(&self) -> Result<RpcLimits, RpcError> {
                 unimplemented!("PswapTestRpc: get_rpc_limits")
             }
-            fn has_rpc_limits(&self) -> Option<RpcLimits> { None }
+            fn has_rpc_limits(&self) -> Option<RpcLimits> {
+                None
+            }
             async fn set_rpc_limits(&self, _: RpcLimits) {
                 unimplemented!("PswapTestRpc: set_rpc_limits")
             }
@@ -889,7 +856,8 @@ mod tests {
                 unimplemented!("PswapTestRpc: get_status_unversioned")
             }
             async fn get_network_note_status(
-                &self, _: NoteId,
+                &self,
+                _: NoteId,
             ) -> Result<NetworkNoteStatusInfo, RpcError> {
                 unimplemented!("PswapTestRpc: get_network_note_status")
             }
@@ -898,14 +866,11 @@ mod tests {
         /// Builds a private-type PSWAP with fixed fixtures (deterministic
         /// `order_id`).
         fn build_private_test_pswap(offered_amount: u64, requested_amount: u64) -> PswapNote {
-            let sender = AccountId::try_from(
-                ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-            ).unwrap();
-            let creator = AccountId::try_from(
-                ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
-            ).unwrap();
-            let offered_faucet =
-                AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+            let sender =
+                AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
+            let creator =
+                AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2).unwrap();
+            let offered_faucet = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
             let requested_faucet =
                 AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
 
@@ -930,7 +895,7 @@ mod tests {
 
         /// Minimum-valid inclusion proof (empty Merkle path, index 0). The
         /// observer / correlator pipeline never inspects the path bytes; only
-        /// the block_num is read for downstream apply.
+        /// the `block_num` is read for downstream apply.
         fn dummy_inclusion_proof(block: u32) -> NoteInclusionProof {
             let path = SparseMerklePath::from_parts(0, std::vec::Vec::new())
                 .expect("empty SparseMerklePath is valid");
@@ -963,11 +928,9 @@ mod tests {
             )
         }
 
-        /// Wraps a list of (note_id, FetchedNote) into the mock RPC.
+        /// Wraps a list of (`note_id`, `FetchedNote`) into the mock RPC.
         fn build_mock_rpc(pairs: Vec<(NoteId, FetchedNote)>) -> Arc<dyn NodeRpcClient> {
-            Arc::new(PswapTestRpc {
-                notes_by_id: pairs.into_iter().collect(),
-            })
+            Arc::new(PswapTestRpc { notes_by_id: pairs.into_iter().collect() })
         }
 
         /// Builds a `StateSyncUpdate` whose `note_updates` carries the
@@ -985,8 +948,8 @@ mod tests {
                 ConsumedUnauthenticatedLocalNoteState,
                 NoteSubmissionData,
             };
-            use miden_protocol::transaction::TransactionId;
             use miden_protocol::Word;
+            use miden_protocol::transaction::TransactionId;
 
             let dummy_consumer =
                 AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
@@ -1017,7 +980,10 @@ mod tests {
                 updated_input_notes,
                 Vec::new(),
             );
-            StateSyncUpdate { note_updates, ..StateSyncUpdate::default() }
+            StateSyncUpdate {
+                note_updates,
+                ..StateSyncUpdate::default()
+            }
         }
 
         /// Bob's account id — used as the consumer in every scenario.
@@ -1028,21 +994,19 @@ mod tests {
         /// End-to-end private-PSWAP partial-fill scenario.
         ///
         /// 1. Alice creates a private PSWAP P0 (offer 100 OA, request 50 RA).
-        /// 2. Bob partial-fills with 20 RA → emits private payback (20 RA to
-        ///    Alice) + private remainder P1 (offer 60 OA, request 30 RA).
+        /// 2. Bob partial-fills with 20 RA → emits private payback (20 RA to Alice) + private
+        ///    remainder P1 (offer 60 OA, request 30 RA).
         /// 3. Alice's wallet syncs:
-        ///    - observer.observe() runs per note → pushes both to pending
-        ///    - observer.apply() fetches attachments via PswapTestRpc, runs
-        ///      correlator, advances lineage to depth 1
-        /// 4. Assert: lineage in DB advanced to depth 1, state=Active,
-        ///    tip=remainder, remaining_offered=60, remaining_requested=30.
+        ///    - `observer.observe()` runs per note → pushes both to pending
+        ///    - `observer.apply()` fetches attachments via `PswapTestRpc`, runs correlator,
+        ///      advances lineage to depth 1
+        /// 4. Assert: lineage in DB advanced to depth 1, state=Active, tip=remainder,
+        ///    `remaining_offered=60`, `remaining_requested=30`.
         #[tokio::test]
-        async fn private_pswap_partial_fill_advances_lineage_end_to_end()
-        -> anyhow::Result<()> {
+        async fn private_pswap_partial_fill_advances_lineage_end_to_end() -> anyhow::Result<()> {
             let store: Arc<dyn Store> = Arc::new(create_test_store().await);
-            let bob = AccountId::try_from(
-                ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-            ).unwrap();
+            let bob =
+                AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
 
             // 1. Alice's PSWAP + lineage row.
             let pswap = build_private_test_pswap(100, 50);
@@ -1053,8 +1017,8 @@ mod tests {
             // 2. Bob's payback + remainder for the partial fill at depth 1.
             let fill_amount = AssetAmount::new(20).unwrap();
             let payout_amount = AssetAmount::new(40).unwrap();
-            let new_offered = AssetAmount::new(60).unwrap();    // 100 - 40
-            let new_requested = AssetAmount::new(30).unwrap();  // 50 - 20
+            let new_offered = AssetAmount::new(60).unwrap(); // 100 - 40
+            let new_requested = AssetAmount::new(30).unwrap(); // 50 - 20
 
             let payback_attach = PswapNoteAttachment::new(fill_amount, pswap.order_id(), 1);
             let payback = pswap.payback_note(bob, &payback_attach).unwrap();
@@ -1064,8 +1028,8 @@ mod tests {
                 .remainder_note(bob, &remainder_attach, new_offered, new_requested)
                 .unwrap();
 
-            // 3. Mock RPC returns FetchedNote::Private with the real
-            //    attachments — emulates the post-#2214 GetNotesById behaviour.
+            // 3. Mock RPC returns FetchedNote::Private with the real attachments — emulates the
+            //    post-#2214 GetNotesById behaviour.
             let inclusion_proof = dummy_inclusion_proof(5);
             let mut notes_by_id = BTreeMap::new();
             notes_by_id.insert(
@@ -1119,13 +1083,10 @@ mod tests {
             assert_eq!(lineage.remaining_offered.amount(), new_offered);
             assert_eq!(lineage.remaining_requested.amount(), new_requested);
 
-            // 6. Lineage should now be visible by the new tip's note id
-            //    (proving the remainder is correctly tracked for round N+1
-            //    detection — see layer-2 fix commit d6995a76).
+            // 6. Lineage should now be visible by the new tip's note id (proving the remainder is
+            //    correctly tracked for round N+1 detection — see layer-2 fix commit d6995a76).
             let by_tip = store
-                .list_pswap_lineages(PswapLineageFilter::ActiveByTipNoteIds(vec![
-                    remainder.id(),
-                ]))
+                .list_pswap_lineages(PswapLineageFilter::ActiveByTipNoteIds(vec![remainder.id()]))
                 .await?;
             assert_eq!(by_tip.len(), 1, "lineage findable by new tip note id");
 
@@ -1136,7 +1097,7 @@ mod tests {
         // FUNCTIONAL SCENARIOS — full fill, reclaim, multi-round
         // =================================================================
 
-        /// Full fill (depth 1) → lineage state becomes FullyFilled, no remainder.
+        /// Full fill (depth 1) → lineage state becomes `FullyFilled`, no remainder.
         ///
         /// Bob exhausts Alice's offered side in one shot. Only the payback
         /// is emitted; the PSWAP script has nothing left to remainder.
@@ -1190,10 +1151,10 @@ mod tests {
         }
 
         /// Same-sync multi-fill — two consecutive rounds land in one sync
-        /// window. The inner `while let Some(at_block_num) = nullifier_to_block.get(...)`
-        /// loop in `discover_pswap_rounds` walks both via in-memory
-        /// advancement. Without this, round 2's tip nullifier would never
-        /// reappear in a future sync window → silently lost.
+        /// window. The `while consumed_note_ids.contains(&tip)` loop in
+        /// `discover_pswap_rounds` walks both via in-memory advancement.
+        /// Without it, round 2's remainder tip would never reappear in a
+        /// later consumed-note set → silently lost.
         #[tokio::test]
         async fn private_pswap_multi_round_same_sync_advances_twice() -> anyhow::Result<()> {
             let store: Arc<dyn Store> = Arc::new(create_test_store().await);
@@ -1201,15 +1162,23 @@ mod tests {
             store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
 
             // Round 1: Bob partial-fill (fill=20, payout=40) → payback + remainder.
-            let p1_attach = PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1);
+            let p1_attach =
+                PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1);
             let payback_1 = pswap.payback_note(bob(), &p1_attach).unwrap();
-            let r1_attach = PswapNoteAttachment::new(AssetAmount::new(40).unwrap(), pswap.order_id(), 1);
-            let remainder_1 = pswap.remainder_note(
-                bob(), &r1_attach, AssetAmount::new(60).unwrap(), AssetAmount::new(30).unwrap(),
-            ).unwrap();
+            let r1_attach =
+                PswapNoteAttachment::new(AssetAmount::new(40).unwrap(), pswap.order_id(), 1);
+            let remainder_1 = pswap
+                .remainder_note(
+                    bob(),
+                    &r1_attach,
+                    AssetAmount::new(60).unwrap(),
+                    AssetAmount::new(30).unwrap(),
+                )
+                .unwrap();
 
             // Round 2: a different consumer fully fills the remainder (fill=30, payout=60).
-            let p2_attach = PswapNoteAttachment::new(AssetAmount::new(30).unwrap(), pswap.order_id(), 2);
+            let p2_attach =
+                PswapNoteAttachment::new(AssetAmount::new(30).unwrap(), pswap.order_id(), 2);
             let payback_2 = pswap.payback_note(bob(), &p2_attach).unwrap();
 
             let inclusion_proof = dummy_inclusion_proof(15);
@@ -1227,10 +1196,9 @@ mod tests {
 
             // BOTH P0 and the round-1 remainder are in the consumed window.
             let p0_note = Note::from(pswap.clone());
-            observer.apply(&consumed_notes_window(vec![
-                (&p0_note, 15),
-                (&remainder_1, 15),
-            ])).await?;
+            observer
+                .apply(&consumed_notes_window(vec![(&p0_note, 15), (&remainder_1, 15)]))
+                .await?;
 
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.current_depth, 2, "advanced through both rounds in one sync");
@@ -1257,14 +1225,15 @@ mod tests {
             // Build a PSWAP whose order_id this client does NOT track (we
             // never call upsert_pswap_lineage for it).
             let foreign = {
-                let sender = AccountId::try_from(
-                    ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
-                ).unwrap();
-                let creator = AccountId::try_from(
-                    ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-                ).unwrap();
-                let offered_faucet = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
-                let requested_faucet = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
+                let sender =
+                    AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2)
+                        .unwrap();
+                let creator =
+                    AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
+                let offered_faucet =
+                    AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+                let requested_faucet =
+                    AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
                 let storage = PswapNoteStorage::builder()
                     .requested_asset(FungibleAsset::new(requested_faucet, 50).unwrap())
                     .creator_account_id(creator)
@@ -1286,9 +1255,10 @@ mod tests {
 
             // Foreign filler emits a payback for the foreign PSWAP.
             let foreign_payback = foreign
-                .payback_note(bob(), &PswapNoteAttachment::new(
-                    AssetAmount::new(20).unwrap(), foreign.order_id(), 1,
-                ))
+                .payback_note(
+                    bob(),
+                    &PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), foreign.order_id(), 1),
+                )
                 .unwrap();
 
             let inclusion_proof = dummy_inclusion_proof(5);
@@ -1314,10 +1284,10 @@ mod tests {
             Ok(())
         }
 
-        /// **Security**: a stale-depth note (a payback we already processed
-        /// or never expected at this depth) must not advance the lineage.
-        /// The forward-only depth filter in `build_chain_note_updates`
-        /// (`if depth < lineage.current_depth + 1`) catches replays.
+        /// **Security**: a stale note replayed without its tip being
+        /// consumed must not advance the lineage. With no consumed note in
+        /// the window, `discover_pswap_rounds` loads no active lineage (its
+        /// `ActiveByTipNoteIds` set is empty) and the replay is ignored.
         #[tokio::test]
         async fn stale_depth_payback_does_not_advance_lineage() -> anyhow::Result<()> {
             let store: Arc<dyn Store> = Arc::new(create_test_store().await);
@@ -1325,11 +1295,16 @@ mod tests {
 
             // Insert lineage as if round 1 ALREADY happened (current_depth=1).
             let mut record = super::build_initial_record(pswap.clone());
-            let r1_attach = PswapNoteAttachment::new(AssetAmount::new(40).unwrap(), pswap.order_id(), 1);
-            let already_at = pswap.remainder_note(
-                bob(), &r1_attach,
-                AssetAmount::new(60).unwrap(), AssetAmount::new(30).unwrap(),
-            ).unwrap();
+            let r1_attach =
+                PswapNoteAttachment::new(AssetAmount::new(40).unwrap(), pswap.order_id(), 1);
+            let already_at = pswap
+                .remainder_note(
+                    bob(),
+                    &r1_attach,
+                    AssetAmount::new(60).unwrap(),
+                    AssetAmount::new(30).unwrap(),
+                )
+                .unwrap();
             record.current_depth = 1;
             record.current_tip_note_id = already_at.id();
             let offered_faucet = pswap.offered_asset().faucet_id();
@@ -1341,10 +1316,12 @@ mod tests {
             store.upsert_pswap_lineage(&record).await?;
 
             // Sync replays an old depth-1 payback (stale).
-            let stale_payback = pswap.payback_note(
-                bob(),
-                &PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1),
-            ).unwrap();
+            let stale_payback = pswap
+                .payback_note(
+                    bob(),
+                    &PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1),
+                )
+                .unwrap();
 
             let inclusion_proof = dummy_inclusion_proof(20);
             let observer = PswapChainObserver::new(
@@ -1365,11 +1342,11 @@ mod tests {
             Ok(())
         }
 
-        /// **Security**: a terminal-state lineage (FullyFilled or Reclaimed)
+        /// **Security**: a terminal-state lineage (`FullyFilled` or `Reclaimed`)
         /// must NOT be advanced even if its old tip nullifier shows up in
         /// the window again (e.g. via re-org or replayed sync data).
         /// Two defenses: `ActiveByTipNoteIds` SQL filter excludes
-        /// non-Active rows; the apply() active-lineage filter is the second
+        /// non-Active rows; the `apply()` active-lineage filter is the second
         /// line of defense.
         #[tokio::test]
         async fn terminal_lineage_is_not_re_advanced() -> anyhow::Result<()> {
@@ -1381,10 +1358,12 @@ mod tests {
             record.state = PswapLineageState::FullyFilled;
             store.upsert_pswap_lineage(&record).await?;
             // Attempt to replay a fill on the terminal lineage.
-            let zombie_payback = pswap.payback_note(
-                bob(),
-                &PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1),
-            ).unwrap();
+            let zombie_payback = pswap
+                .payback_note(
+                    bob(),
+                    &PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1),
+                )
+                .unwrap();
             let inclusion_proof = dummy_inclusion_proof(30);
             let observer = PswapChainObserver::new(
                 store.clone(),

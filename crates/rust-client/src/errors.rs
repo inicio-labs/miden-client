@@ -179,16 +179,6 @@ pub enum ClientError {
         #[source]
         source: RpcError,
     },
-    /// A reconstructed note's commitment / ID did not match the observed
-    /// on-chain note. Fail-loud: indicates protocol/client version skew or
-    /// row corruption. Generic across observers that reconstruct notes
-    /// (PSWAP today; any future observer with the same reconstruction
-    /// contract can reuse this variant).
-    #[error(
-        "reconstructed note id {reconstructed} does not match observed id {observed}; \
-         lineage round skipped to avoid corruption (protocol/client version skew or row corruption)"
-    )]
-    NoteCommitmentMismatch { reconstructed: String, observed: String },
     #[error(transparent)]
     PswapLineageError(#[from] crate::pswap::PswapLineageError),
 }

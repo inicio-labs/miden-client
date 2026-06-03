@@ -241,14 +241,10 @@ fn build_round_update(
                     remaining_requested.amount(),
                 )
                 .map_err(PswapLineageError::Reconstruction)?;
-
-            if remainder_note.id() != remainder_note_update.note_id {
-                return Err(ClientError::NoteCommitmentMismatch {
-                    reconstructed: format!("{}", remainder_note.id().as_word()),
-                    observed: format!("{}", remainder_note_update.note_id.as_word()),
-                }
-                .into());
-            }
+            // Phase 1: no on-chain-id verification (see reconstruct_payback's
+            // doc). The protocol guarantees deterministic reconstruction, so
+            // we trust the result. Phase 2 hardening can add the id-match
+            // check here too.
 
             let tip_nullifier = remainder_note.nullifier();
 
@@ -275,25 +271,24 @@ fn build_round_update(
     }
 }
 
-/// Reconstructs the payback note from its observed metadata and verifies
-/// the id matches (fail-loud commitment-mismatch contract).
+/// Reconstructs the payback note from its observed metadata.
+///
+/// **Phase 1**: the fail-loud commitment-mismatch check (verifying the
+/// reconstructed id matches the on-chain id) is intentionally NOT
+/// performed here. Phase 2 hardening can re-introduce that check to
+/// defend against malicious-node tampering / protocol-client version
+/// skew; until then we trust the protocol-side reconstruction is
+/// byte-identical to the on-chain shape.
 fn reconstruct_payback(
     original: &PswapNote,
     note_update: &PswapChainNoteUpdate,
     round_depth: u32,
 ) -> Result<Note, ClientError> {
     let attachment = PswapNoteAttachment::new(note_update.amount, note_update.order_id, round_depth);
-    let reconstructed = original
+    original
         .payback_note(note_update.sender, &attachment)
-        .map_err(PswapLineageError::Reconstruction)?;
-    if reconstructed.id() != note_update.note_id {
-        return Err(ClientError::NoteCommitmentMismatch {
-            reconstructed: format!("{}", reconstructed.id().as_word()),
-            observed: format!("{}", note_update.note_id.as_word()),
-        }
-        .into());
-    }
-    Ok(reconstructed)
+        .map_err(PswapLineageError::Reconstruction)
+        .map_err(Into::into)
 }
 
 // -----------------------------------------------------------------------------

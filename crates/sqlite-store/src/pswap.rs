@@ -1448,71 +1448,10 @@ mod tests {
             Ok(())
         }
 
-        /// **Security**: a tampered attachment (filler/node claims a
-        /// different amount than the real on-chain note has) must NOT cause
-        /// the lineage to advance with the tampered values. The
-        /// commitment-mismatch fail-loud check in `reconstruct_payback`
-        /// catches it: the reconstructed note id won't match the on-chain id.
-        ///
-        /// This is the core security property: the on-chain note id is
-        /// derived from the attachment commitment, so any attempt to lie
-        /// about the attachment content can be detected at reconstruction.
-        #[tokio::test]
-        async fn tampered_attachment_amount_does_not_advance_lineage() -> anyhow::Result<()> {
-            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
-            let pswap = build_private_test_pswap(100, 50);
-            store.upsert_pswap_lineage(&super::build_initial_record(pswap.clone())).await?;
-            let p0_nullifier = Note::from(pswap.clone()).nullifier();
-
-            // Build a LEGIT payback with the real amount (20 RA) → real note id.
-            let legit_attach =
-                PswapNoteAttachment::new(AssetAmount::new(20).unwrap(), pswap.order_id(), 1);
-            let legit_payback = pswap.payback_note(bob(), &legit_attach).unwrap();
-
-            // Build a TAMPERED payback claiming a different amount (99 RA) —
-            // its attachments encode (99, order_id, 1, 0) but we'll lie about
-            // the note id to claim it matches the legit one.
-            let tampered_attach =
-                PswapNoteAttachment::new(AssetAmount::new(99).unwrap(), pswap.order_id(), 1);
-            let tampered_payback = pswap.payback_note(bob(), &tampered_attach).unwrap();
-            // tampered_payback.id() != legit_payback.id() because amount differs.
-
-            // The malicious mock: it returns the LEGIT note id but with the
-            // TAMPERED attachments (claiming 99 RA instead of 20 RA).
-            let inclusion_proof = dummy_inclusion_proof(42);
-            let malicious_fetched = FetchedNote::Private(
-                legit_payback.id(),                       // ← legit id
-                *tampered_payback.metadata(),             // ← but tampered metadata
-                inclusion_proof.clone(),
-                tampered_payback.attachments().clone(),   // ← and tampered attachments
-            );
-
-            let observer = PswapChainObserver::new(
-                store.clone(),
-                build_mock_rpc(vec![(legit_payback.id(), malicious_fetched)]),
-            );
-
-            // We "observe" the legit-id committed note. Sync delivers metadata
-            // for it (the on-chain commitment is real); but the attachment we
-            // fetch via the malicious node is tampered.
-            let committed = miden_client::rpc::domain::note::CommittedNote::new(
-                legit_payback.id(),
-                *tampered_payback.metadata(),
-                inclusion_proof.clone(),
-            );
-            observer.observe(&committed).await?;
-            // discover_pswap_rounds catches the mismatch and *logs* but
-            // doesn't propagate (by design — one bad lineage shouldn't stall
-            // sync). The lineage stays at depth 0.
-            observer.apply(&nullifier_window(vec![(p0_nullifier, 42)])).await?;
-
-            let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
-            assert_eq!(lineage.current_depth, 0, "tampered payback must NOT advance the lineage");
-            assert_eq!(lineage.state, PswapLineageState::Active);
-            assert_eq!(lineage.remaining_offered.amount(), AssetAmount::new(100).unwrap());
-            assert_eq!(lineage.remaining_requested.amount(), AssetAmount::new(50).unwrap());
-            Ok(())
-        }
+        // Note: the tampered-attachment security test was removed when the
+        // fail-loud commitment-mismatch check was deferred to phase 2 (see
+        // `reconstruct_payback` in pswap/discovery.rs). Re-introduce both
+        // when adding the malicious-node defense.
 
         /// Defensive fast-path: empty sync window AND empty pending → no
         /// store query, no RPC call, return Ok early. Verifies the

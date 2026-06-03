@@ -800,4 +800,346 @@ mod tests {
 
         Ok(())
     }
+
+    // =========================================================================
+    // PRIVATE-PSWAP END-TO-END VIA THE OBSERVER PIPELINE
+    // =========================================================================
+    //
+    // Exercises the temp commit that unstubs private-note attachment handling
+    // (mirrors upstream PR #2214). Scenario: Alice creates a private PSWAP P0,
+    // Bob does a partial fill at depth 1, Alice's wallet runs the observer
+    // pipeline (observe + apply with mock RPC supplying attachments), and the
+    // lineage advances correctly to depth 1.
+    //
+    // The PswapTestRpc stub below implements only get_notes_by_id meaningfully
+    // — every other NodeRpcClient method panics with unimplemented!(). This is
+    // adequate because PswapChainObserver::apply() only calls get_notes_by_id.
+
+    mod private_pswap_e2e {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use async_trait::async_trait;
+        use miden_client::account::AccountId;
+        use miden_client::asset::FungibleAsset;
+        use miden_client::note::{
+            BlockNumber,
+            Note,
+            NoteId,
+            NoteInclusionProof,
+            NoteScript,
+            NoteTag,
+            PswapNote,
+        };
+        use miden_client::pswap::{
+            PswapChainObserver,
+            PswapLineageFilter,
+            PswapLineageState,
+        };
+        use miden_client::rpc::domain::account::AccountProof;
+        use miden_client::rpc::domain::account_vault::AccountVaultInfo;
+        use miden_client::rpc::domain::note::{FetchedNote, NoteSyncBlock};
+        use miden_client::rpc::domain::storage_map::StorageMapInfo;
+        use miden_client::rpc::domain::transaction::TransactionRecord;
+        use miden_client::rpc::domain::nullifier::NullifierUpdate;
+        use miden_client::rpc::domain::sync::{ChainMmrInfo, SyncTarget};
+        use miden_client::rpc::{
+            AccountStateAt,
+            NetworkNoteStatusInfo,
+            NodeRpcClient,
+            RpcError,
+            RpcLimits,
+            RpcStatusInfo,
+        };
+        use miden_client::store::Store;
+        use miden_client::sync::{NoteObserver, StateSyncUpdate};
+        use miden_protocol::Word;
+        use miden_protocol::account::AccountCode;
+        use miden_protocol::address::NetworkId;
+        use miden_protocol::asset::AssetAmount;
+        use miden_protocol::batch::{ProposedBatch, ProvenBatch};
+        use miden_protocol::block::{BlockHeader, ProvenBlock};
+        use miden_protocol::crypto::merkle::SparseMerklePath;
+        use miden_protocol::crypto::merkle::mmr::MmrProof;
+        use miden_protocol::note::NoteType;
+        use miden_protocol::testing::account_id::{
+            ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
+            ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+            ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+            ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+        };
+        use miden_protocol::transaction::{ProvenTransaction, TransactionInputs};
+        use miden_standards::note::{
+            PswapNoteAttachment,
+            PswapNoteStorage,
+        };
+        use std::sync::Arc;
+
+        use crate::tests::create_test_store;
+
+        /// Stub `NodeRpcClient` that only implements `get_notes_by_id`. Every
+        /// other method panics — the test exercises a path that only triggers
+        /// the one method we care about. Drop this when upstream PR #2214
+        /// lands and provides a richer mock.
+        struct PswapTestRpc {
+            notes_by_id: BTreeMap<NoteId, FetchedNote>,
+        }
+
+        #[async_trait]
+        impl NodeRpcClient for PswapTestRpc {
+            async fn get_notes_by_id(
+                &self,
+                note_ids: &[NoteId],
+            ) -> Result<Vec<FetchedNote>, RpcError> {
+                Ok(note_ids
+                    .iter()
+                    .filter_map(|id| self.notes_by_id.get(id).cloned())
+                    .collect())
+            }
+
+            // ----- The rest panics; not exercised by this test. -----
+            async fn set_genesis_commitment(&self, _: Word) -> Result<(), RpcError> {
+                unimplemented!("PswapTestRpc: set_genesis_commitment")
+            }
+            fn has_genesis_commitment(&self) -> Option<Word> { None }
+            async fn submit_proven_transaction(
+                &self, _: ProvenTransaction, _: TransactionInputs,
+            ) -> Result<BlockNumber, RpcError> {
+                unimplemented!("PswapTestRpc: submit_proven_transaction")
+            }
+            async fn submit_proven_batch(
+                &self, _: ProvenBatch, _: ProposedBatch, _: Vec<TransactionInputs>,
+            ) -> Result<BlockNumber, RpcError> {
+                unimplemented!("PswapTestRpc: submit_proven_batch")
+            }
+            async fn get_block_header_by_number(
+                &self, _: Option<BlockNumber>, _: bool,
+            ) -> Result<(BlockHeader, Option<MmrProof>), RpcError> {
+                unimplemented!("PswapTestRpc: get_block_header_by_number")
+            }
+            async fn get_block_by_number(
+                &self, _: BlockNumber, _: bool,
+            ) -> Result<ProvenBlock, RpcError> {
+                unimplemented!("PswapTestRpc: get_block_by_number")
+            }
+            async fn sync_chain_mmr(
+                &self, _: BlockNumber, _: SyncTarget,
+            ) -> Result<ChainMmrInfo, RpcError> {
+                unimplemented!("PswapTestRpc: sync_chain_mmr")
+            }
+            async fn sync_notes(
+                &self, _: BlockNumber, _: BlockNumber, _: &BTreeSet<NoteTag>,
+            ) -> Result<Vec<NoteSyncBlock>, RpcError> {
+                unimplemented!("PswapTestRpc: sync_notes")
+            }
+            async fn sync_nullifiers(
+                &self, _: &[u16], _: BlockNumber, _: BlockNumber,
+            ) -> Result<Vec<NullifierUpdate>, RpcError> {
+                unimplemented!("PswapTestRpc: sync_nullifiers")
+            }
+            async fn get_account_proof(
+                &self,
+                _: AccountId,
+                _: miden_client::rpc::domain::account::AccountStorageRequirements,
+                _: AccountStateAt,
+                _: Option<AccountCode>,
+                _: Option<Word>,
+            ) -> Result<(BlockNumber, AccountProof), RpcError> {
+                unimplemented!("PswapTestRpc: get_account_proof")
+            }
+            async fn get_note_script_by_root(
+                &self, _: Word,
+            ) -> Result<Option<NoteScript>, RpcError> {
+                unimplemented!("PswapTestRpc: get_note_script_by_root")
+            }
+            async fn sync_storage_maps(
+                &self, _: BlockNumber, _: Option<BlockNumber>, _: AccountId,
+            ) -> Result<StorageMapInfo, RpcError> {
+                unimplemented!("PswapTestRpc: sync_storage_maps")
+            }
+            async fn sync_account_vault(
+                &self, _: BlockNumber, _: Option<BlockNumber>, _: AccountId,
+            ) -> Result<AccountVaultInfo, RpcError> {
+                unimplemented!("PswapTestRpc: sync_account_vault")
+            }
+            async fn sync_transactions(
+                &self, _: BlockNumber, _: BlockNumber, _: Vec<AccountId>,
+            ) -> Result<Vec<TransactionRecord>, RpcError> {
+                unimplemented!("PswapTestRpc: sync_transactions")
+            }
+            async fn get_network_id(&self) -> Result<NetworkId, RpcError> {
+                unimplemented!("PswapTestRpc: get_network_id")
+            }
+            async fn get_rpc_limits(&self) -> Result<RpcLimits, RpcError> {
+                unimplemented!("PswapTestRpc: get_rpc_limits")
+            }
+            fn has_rpc_limits(&self) -> Option<RpcLimits> { None }
+            async fn set_rpc_limits(&self, _: RpcLimits) {
+                unimplemented!("PswapTestRpc: set_rpc_limits")
+            }
+            async fn get_status_unversioned(&self) -> Result<RpcStatusInfo, RpcError> {
+                unimplemented!("PswapTestRpc: get_status_unversioned")
+            }
+            async fn get_network_note_status(
+                &self, _: NoteId,
+            ) -> Result<NetworkNoteStatusInfo, RpcError> {
+                unimplemented!("PswapTestRpc: get_network_note_status")
+            }
+        }
+
+        /// Builds a private-type PSWAP with fixed fixtures (deterministic
+        /// `order_id`).
+        fn build_private_test_pswap(offered_amount: u64, requested_amount: u64) -> PswapNote {
+            let sender = AccountId::try_from(
+                ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+            ).unwrap();
+            let creator = AccountId::try_from(
+                ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+            ).unwrap();
+            let offered_faucet =
+                AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+            let requested_faucet =
+                AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
+
+            let storage = PswapNoteStorage::builder()
+                .requested_asset(FungibleAsset::new(requested_faucet, requested_amount).unwrap())
+                .creator_account_id(creator)
+                .build();
+            PswapNote::builder()
+                .sender(sender)
+                .storage(storage)
+                .serial_number(Word::from([
+                    miden_protocol::Felt::new(7).unwrap(),
+                    miden_protocol::Felt::new(8).unwrap(),
+                    miden_protocol::Felt::new(9).unwrap(),
+                    miden_protocol::Felt::new(10).unwrap(),
+                ]))
+                .note_type(NoteType::Private)
+                .offered_asset(FungibleAsset::new(offered_faucet, offered_amount).unwrap())
+                .build()
+                .unwrap()
+        }
+
+        /// Minimum-valid inclusion proof (empty Merkle path, index 0). The
+        /// observer / correlator pipeline never inspects the path bytes; only
+        /// the block_num is read for downstream apply.
+        fn dummy_inclusion_proof(block: u32) -> NoteInclusionProof {
+            let path = SparseMerklePath::from_parts(0, std::vec::Vec::new())
+                .expect("empty SparseMerklePath is valid");
+            NoteInclusionProof::new(BlockNumber::from(block), 0, path)
+                .expect("zero index is well below per-block notes ceiling")
+        }
+
+        /// End-to-end private-PSWAP partial-fill scenario.
+        ///
+        /// 1. Alice creates a private PSWAP P0 (offer 100 OA, request 50 RA).
+        /// 2. Bob partial-fills with 20 RA → emits private payback (20 RA to
+        ///    Alice) + private remainder P1 (offer 60 OA, request 30 RA).
+        /// 3. Alice's wallet syncs:
+        ///    - observer.observe() runs per note → pushes both to pending
+        ///    - observer.apply() fetches attachments via PswapTestRpc, runs
+        ///      correlator, advances lineage to depth 1
+        /// 4. Assert: lineage in DB advanced to depth 1, state=Active,
+        ///    tip=remainder, remaining_offered=60, remaining_requested=30.
+        #[tokio::test]
+        async fn private_pswap_partial_fill_advances_lineage_end_to_end()
+        -> anyhow::Result<()> {
+            let store: Arc<dyn Store> = Arc::new(create_test_store().await);
+            let bob = AccountId::try_from(
+                ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+            ).unwrap();
+
+            // 1. Alice's PSWAP + lineage row.
+            let pswap = build_private_test_pswap(100, 50);
+            let lineage_record = super::build_initial_record(pswap.clone());
+            store.upsert_pswap_lineage(&lineage_record).await?;
+            // PswapNote doesn't expose nullifier directly — derive it from the Note view.
+            let p0_nullifier = Note::from(pswap.clone()).nullifier();
+
+            // 2. Bob's payback + remainder for the partial fill at depth 1.
+            let fill_amount = AssetAmount::new(20).unwrap();
+            let payout_amount = AssetAmount::new(40).unwrap();
+            let new_offered = AssetAmount::new(60).unwrap();    // 100 - 40
+            let new_requested = AssetAmount::new(30).unwrap();  // 50 - 20
+
+            let payback_attach = PswapNoteAttachment::new(fill_amount, pswap.order_id(), 1);
+            let payback = pswap.payback_note(bob, &payback_attach).unwrap();
+
+            let remainder_attach = PswapNoteAttachment::new(payout_amount, pswap.order_id(), 1);
+            let remainder = pswap
+                .remainder_note(bob, &remainder_attach, new_offered, new_requested)
+                .unwrap();
+
+            // 3. Mock RPC returns FetchedNote::Private with the real
+            //    attachments — emulates the post-#2214 GetNotesById behaviour.
+            let inclusion_proof = dummy_inclusion_proof(5);
+            let mut notes_by_id = BTreeMap::new();
+            notes_by_id.insert(
+                payback.id(),
+                FetchedNote::Private(
+                    payback.id(),
+                    *payback.metadata(),
+                    inclusion_proof.clone(),
+                    payback.attachments().clone(),
+                ),
+            );
+            notes_by_id.insert(
+                remainder.id(),
+                FetchedNote::Private(
+                    remainder.id(),
+                    *remainder.metadata(),
+                    inclusion_proof.clone(),
+                    remainder.attachments().clone(),
+                ),
+            );
+            let mock_rpc: Arc<dyn NodeRpcClient> = Arc::new(PswapTestRpc { notes_by_id });
+
+            // 4. Build observer + drive the observe / apply phases.
+            let observer = PswapChainObserver::new(store.clone(), mock_rpc);
+
+            let payback_committed = miden_client::rpc::domain::note::CommittedNote::new(
+                payback.id(),
+                *payback.metadata(),
+                inclusion_proof.clone(),
+            );
+            let remainder_committed = miden_client::rpc::domain::note::CommittedNote::new(
+                remainder.id(),
+                *remainder.metadata(),
+                inclusion_proof.clone(),
+            );
+            observer.observe(&payback_committed).await?;
+            observer.observe(&remainder_committed).await?;
+
+            // P0's nullifier IS in the consumed window (Bob consumed P0).
+            let mut sync_update = StateSyncUpdate::default();
+            sync_update.current_window_nullifier_blocks =
+                vec![(p0_nullifier, BlockNumber::from(5))];
+
+            observer.apply(&sync_update).await?;
+
+            // 5. Assert: lineage in store advanced to depth 1.
+            let lineage = store
+                .get_pswap_lineage(pswap.order_id())
+                .await?
+                .expect("lineage exists in store");
+            assert_eq!(lineage.current_depth, 1, "lineage advanced to depth 1");
+            assert_eq!(lineage.state, PswapLineageState::Active, "still Active after partial fill");
+            assert_eq!(lineage.current_tip_note_id, remainder.id(), "tip moved to remainder");
+            assert_eq!(lineage.remaining_offered, new_offered);
+            assert_eq!(lineage.remaining_requested, new_requested);
+
+            // 6. Lineage should now be visible by the new tip's nullifier
+            //    (proving the remainder's nullifier is correctly tracked for
+            //    round N+1 detection — see layer-2 fix commit d6995a76).
+            let by_tip = store
+                .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(vec![
+                    remainder.nullifier(),
+                ]))
+                .await?;
+            // (remainder is a `Note`, which DOES have nullifier() directly — no
+            // need for the Note::from(...) dance we did for PswapNote earlier.)
+            assert_eq!(by_tip.len(), 1, "lineage findable by new tip nullifier");
+
+            Ok(())
+        }
+    }
 }

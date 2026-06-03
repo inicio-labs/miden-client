@@ -14,8 +14,7 @@ use alloc::vec::Vec;
 
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{Note, NoteId};
-use miden_standards::note::{PswapNote, PswapNoteAttachment};
+use miden_protocol::note::NoteId;
 use tracing::error;
 
 use super::errors::PswapLineageError;
@@ -64,7 +63,7 @@ pub async fn discover_pswap_rounds(
         BTreeMap::new();
     for note in chain_note_updates {
         notes_by_order_depth
-            .entry((OrderIdKey::from(note.order_id), note.depth))
+            .entry((OrderIdKey::from(note.attachment.order_id()), note.attachment.depth()))
             .or_insert_with(Vec::new)
             .push(note);
     }
@@ -149,8 +148,10 @@ fn build_round_update(
         1 => {
             // Full fill — only payback emitted; remaining_requested → 0.
             let payback_note_update = notes[0];
-            let payback = reconstruct_payback(original, payback_note_update, round_depth)?;
-            let fill_amount = to_fill(payback_note_update.amount)
+            let payback = original
+                .payback_note(payback_note_update.sender, &payback_note_update.attachment)
+                .map_err(PswapLineageError::Reconstruction)?;
+            let fill_amount = to_fill(payback_note_update.attachment.amount())
                 .map_err(ClientError::AssetError)?;
 
             Ok(Some(PswapLineageRoundUpdate {
@@ -179,12 +180,13 @@ fn build_round_update(
                 (notes[1], notes[0])
             };
 
-            let payback_note =
-                reconstruct_payback(original, payback_note_update, round_depth)?;
+            let payback_note = original
+                .payback_note(payback_note_update.sender, &payback_note_update.attachment)
+                .map_err(PswapLineageError::Reconstruction)?;
 
-            let fill_amount = to_fill(payback_note_update.amount)
+            let fill_amount = to_fill(payback_note_update.attachment.amount())
                 .map_err(ClientError::AssetError)?;
-            let payout_amount = to_payout(remainder_note_update.amount)
+            let payout_amount = to_payout(remainder_note_update.attachment.amount())
                 .map_err(ClientError::AssetError)?;
 
             // Saturating sub — clamp to zero on over-fill.
@@ -193,15 +195,10 @@ fn build_round_update(
             let remaining_offered = lineage.remaining_offered.sub(payout_amount)
                 .unwrap_or(zero_offered);
 
-            let attachment = PswapNoteAttachment::new(
-                remainder_note_update.amount,
-                lineage.order_id(),
-                round_depth,
-            );
             let remainder_note = original
                 .remainder_note(
                     remainder_note_update.sender,
-                    &attachment,
+                    &remainder_note_update.attachment,
                     remaining_offered.amount(),
                     remaining_requested.amount(),
                 )
@@ -225,19 +222,6 @@ fn build_round_update(
         },
         _ => unreachable!("PSWAP emits ≤ 2 notes per (order_id, depth)"),
     }
-}
-
-/// Reconstructs the payback note. No id-match verification (phase 2 task).
-fn reconstruct_payback(
-    original: &PswapNote,
-    note_update: &PswapChainNoteUpdate,
-    round_depth: u32,
-) -> Result<Note, ClientError> {
-    let attachment = PswapNoteAttachment::new(note_update.amount, note_update.order_id, round_depth);
-    original
-        .payback_note(note_update.sender, &attachment)
-        .map_err(PswapLineageError::Reconstruction)
-        .map_err(Into::into)
 }
 
 // -----------------------------------------------------------------------------
@@ -272,12 +256,11 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use miden_protocol::Felt;
     use miden_protocol::account::AccountId;
     use miden_protocol::asset::AssetAmount;
     use miden_protocol::crypto::merkle::SparseMerklePath;
-    use miden_protocol::note::NoteInclusionProof;
-    use miden_standards::note::PswapNoteAttachment;
+    use miden_protocol::note::{Note, NoteInclusionProof};
+    use miden_standards::note::{PswapNote, PswapNoteAttachment};
 
     use super::super::lineage::test_helpers::{build_test_pswap, fixed_account_ids};
     use super::*;
@@ -325,17 +308,13 @@ mod tests {
     /// correlator's tag-based payback/remainder split works.
     fn chain_update_from(
         note: &Note,
-        order_id: Felt,
-        depth: u32,
-        amount: u64,
+        attachment: PswapNoteAttachment,
         sender: AccountId,
         block: u32,
     ) -> PswapChainNoteUpdate {
         PswapChainNoteUpdate {
             note_id: note.id(),
-            order_id,
-            depth,
-            amount: AssetAmount::new(amount).expect("test amount fits in AssetAmount"),
+            attachment,
             sender,
             tag: note.metadata().tag(),
             block_num: BlockNumber::from(block),
@@ -365,15 +344,15 @@ mod tests {
         let new_off = 100 - payout_amount;
         let new_req = 50 - fill_amount;
 
-        let payback = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, fill_amount)).unwrap();
+        let payback_att = pswap_attachment(&pswap, 1, fill_amount);
+        let remainder_att = pswap_attachment(&pswap, 1, payout_amount);
+        let payback = pswap.payback_note(consumer, &payback_att).unwrap();
         let remainder = pswap
-            .remainder_note(consumer, &pswap_attachment(&pswap, 1, payout_amount), asset_amount(new_off), asset_amount(new_req))
+            .remainder_note(consumer, &remainder_att, asset_amount(new_off), asset_amount(new_req))
             .unwrap();
 
-        let order_id = pswap.order_id();
-        let cand_payback = chain_update_from(&payback, order_id, 1, fill_amount, consumer, 7);
-        let cand_remainder =
-            chain_update_from(&remainder, order_id, 1, payout_amount, consumer, 7);
+        let cand_payback = chain_update_from(&payback, payback_att, consumer, 7);
+        let cand_remainder = chain_update_from(&remainder, remainder_att, consumer, 7);
 
         let update = build_round_update(
             &record,
@@ -415,9 +394,9 @@ mod tests {
         let record = initial_record(pswap.clone(), 30, 50);
 
         let fill_amount = 50; // exhausts requested side
-        let payback = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, fill_amount)).unwrap();
-        let order_id = pswap.order_id();
-        let cand = chain_update_from(&payback, order_id, 1, fill_amount, consumer, 9);
+        let payback_att = pswap_attachment(&pswap, 1, fill_amount);
+        let payback = pswap.payback_note(consumer, &payback_att).unwrap();
+        let cand = chain_update_from(&payback, payback_att, consumer, 9);
 
         let update = build_round_update(&record, 1, BlockNumber::from(9), &[&cand])
             .unwrap()
@@ -487,13 +466,14 @@ mod tests {
         let payout1 = 40;
         let new_off1 = 100 - payout1;
         let new_req1 = 50 - fill1;
-        let payback1 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 1, fill1)).unwrap();
+        let payback_att1 = pswap_attachment(&pswap, 1, fill1);
+        let remainder_att1 = pswap_attachment(&pswap, 1, payout1);
+        let payback1 = pswap.payback_note(consumer, &payback_att1).unwrap();
         let remainder1 = pswap
-            .remainder_note(consumer, &pswap_attachment(&pswap, 1, payout1), asset_amount(new_off1), asset_amount(new_req1))
+            .remainder_note(consumer, &remainder_att1, asset_amount(new_off1), asset_amount(new_req1))
             .unwrap();
-        let order_id = pswap.order_id();
-        let cand_p1 = chain_update_from(&payback1, order_id, 1, fill1, consumer, 11);
-        let cand_r1 = chain_update_from(&remainder1, order_id, 1, payout1, consumer, 11);
+        let cand_p1 = chain_update_from(&payback1, payback_att1, consumer, 11);
+        let cand_r1 = chain_update_from(&remainder1, remainder_att1, consumer, 11);
 
         let update1 =
             build_round_update(&record0, 1, BlockNumber::from(11), &[&cand_p1, &cand_r1])
@@ -510,8 +490,9 @@ mod tests {
 
         // ── Round 2: full fill of the remainder, exhausts requested side.
         let fill2 = new_req1; // = 30
-        let payback2 = pswap.payback_note(consumer, &pswap_attachment(&pswap, 2, fill2)).unwrap();
-        let cand_p2 = chain_update_from(&payback2, order_id, 2, fill2, consumer, 11);
+        let payback_att2 = pswap_attachment(&pswap, 2, fill2);
+        let payback2 = pswap.payback_note(consumer, &payback_att2).unwrap();
+        let cand_p2 = chain_update_from(&payback2, payback_att2, consumer, 11);
 
         let update2 = build_round_update(&record1, 2, BlockNumber::from(11), &[&cand_p2])
             .unwrap()

@@ -6,12 +6,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use async_trait::async_trait;
-use miden_protocol::Felt;
 use miden_protocol::account::AccountId;
-use miden_protocol::asset::AssetAmount;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{NoteId, NoteInclusionProof, NoteTag};
-use miden_standards::note::PswapNote;
+use miden_standards::note::{PswapNote, PswapNoteAttachment};
 use tracing::warn;
 
 use crate::ClientError;
@@ -24,18 +22,13 @@ use crate::utils::RwLock;
 // PSWAP CHAIN NOTE UPDATE
 // ================================================================================================
 
-/// Observed PSWAP-attachment note resolved against an active lineage.
-/// Built in `apply()` after `GetNotesById` resolves the attachment word.
+/// Observed PSWAP-attachment note. The typed attachment carries
+/// `order_id`, `depth`, and amount (fill on payback, payout on remainder)
+/// — role distinguished by [`Self::tag`].
 #[derive(Debug, Clone)]
 pub struct PswapChainNoteUpdate {
     pub note_id: NoteId,
-    /// Attachment slot `[1]` — stable across the chain.
-    pub order_id: Felt,
-    /// Attachment slot `[2]` — round counter.
-    pub depth: u32,
-    /// Attachment slot `[0]` — `fill_amount` (payback) or `payout_amount`
-    /// (remainder). Role distinguished by [`Self::tag`].
-    pub amount: AssetAmount,
+    pub attachment: PswapNoteAttachment,
     pub sender: AccountId,
     /// Payback uses the P2ID-style tag; remainder uses the asset-pair tag.
     pub tag: NoteTag,
@@ -174,14 +167,12 @@ impl PswapChainObserver {
             let Some(pending_rec) = pending.iter().find(|p| p.note_id == fetched_note.id()) else {
                 continue;
             };
-            let Some((order_id, depth, amount)) = extract_pswap_attachment(&fetched_note) else {
+            let Some(attachment) = extract_pswap_attachment(&fetched_note) else {
                 continue;
             };
             updates.push(PswapChainNoteUpdate {
                 note_id: pending_rec.note_id,
-                order_id,
-                depth,
-                amount,
+                attachment,
                 sender: pending_rec.sender,
                 tag: pending_rec.tag,
                 block_num: pending_rec.block_num,
@@ -196,10 +187,12 @@ impl PswapChainObserver {
 // HELPERS
 // ---------------------------------------------------------------------------
 
-/// Extracts `(order_id, depth, amount)` from attachment word
-/// `[amount, order_id, depth, 0]`. **TEMP** — replaced once PR #2214
+/// Pulls the typed [`PswapNoteAttachment`] off a fetched note's attachment
+/// word `[amount, order_id, depth, 0]`. **TEMP** — replaced once PR #2214
 /// ships attachments inline on `StateSyncUpdate`.
-fn extract_pswap_attachment(fetched_note: &FetchedNote) -> Option<(Felt, u32, AssetAmount)> {
+fn extract_pswap_attachment(fetched_note: &FetchedNote) -> Option<PswapNoteAttachment> {
+    use miden_protocol::asset::AssetAmount;
+
     let attachments = match fetched_note {
         FetchedNote::Private(_, _, _, attachments) => attachments,
         FetchedNote::Public(note, _) => note.attachments(),
@@ -211,5 +204,5 @@ fn extract_pswap_attachment(fetched_note: &FetchedNote) -> Option<(Felt, u32, As
     let amount = AssetAmount::new(word[0].as_canonical_u64()).ok()?;
     let order_id = word[1];
     let depth = u32::try_from(word[2].as_canonical_u64()).ok()?;
-    Some((order_id, depth, amount))
+    Some(PswapNoteAttachment::new(amount, order_id, depth))
 }

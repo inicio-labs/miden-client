@@ -1,12 +1,11 @@
-//! Post-sync correlator that joins consumed-nullifier events with the
-//! PSWAP-attachment notes collected by [`super::observer::PswapChainObserver`]
-//! and emits [`super::lineage::PswapLineageRoundUpdate`] entries describing
-//! each round transition.
+//! Post-sync correlator: joins tracked-note consumption events from
+//! `NoteUpdateTracker::consumed_note_ids()` with the PSWAP-attachment
+//! notes collected by [`super::observer::PswapChainObserver`], emitting
+//! one [`super::lineage::PswapLineageRoundUpdate`] per round transition.
 //!
-//! See module-level docs on [`crate::pswap`] for the overall design and
-//! the `pswap_creator_reconstructs_lineage_from_attachments` test in the
-//! protocol repo (`crates/miden-testing/tests/scripts/pswap.rs`) for the
-//! executable contract this correlator implements at runtime.
+//! See [`crate::pswap`] for overall design and the
+//! `pswap_creator_reconstructs_lineage_from_attachments` test in the
+//! protocol repo for the executable contract this implements.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;

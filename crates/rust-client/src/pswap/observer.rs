@@ -1,5 +1,5 @@
-//! Per-note observer that collects PSWAP-attachment notes for active
-//! lineages during sync.
+//! Per-note observer that collects every PSWAP-attachment note seen
+//! during sync. Lineage-scope filtering happens later, in `discovery`.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -53,7 +53,7 @@ struct PendingPswapNote {
 // PSWAP CHAIN OBSERVER
 // ================================================================================================
 
-/// Per-sync collector of PSWAP-attachment notes for this client's lineages.
+/// Per-sync collector of PSWAP-attachment notes seen this sync.
 ///
 /// - `observe()` runs per-note during sync: cheap PSWAP-scheme filter,
 ///   queues a pending record (no store query, no RPC, no DB write).
@@ -65,8 +65,7 @@ pub struct PswapChainObserver {
     /// `StateSyncUpdate` — observer can then read them inline from
     /// `observe()`'s `CommittedNote` without a per-sync RPC round trip.
     rpc: Arc<dyn NodeRpcClient>,
-    /// Used as a `Mutex<Vec<_>>` — `observe()` writes, `apply()` drains,
-    /// never concurrently.
+    /// `observe()` writes, `apply()` drains; never concurrent.
     pending_pswap_notes: Arc<RwLock<Vec<PendingPswapNote>>>,
 }
 

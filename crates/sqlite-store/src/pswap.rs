@@ -1047,17 +1047,14 @@ mod tests {
             })
         }
 
-        /// Builds a `StateSyncUpdate` whose `note_updates` carries the given
-        /// notes as already-consumed input notes at the given blocks. The
-        /// PSWAP correlator reads consumed `(nullifier, block)` pairs via
-        /// `note_updates.consumed_nullifier_blocks()`.
+        /// Builds a `StateSyncUpdate` whose `note_updates` carries the
+        /// given notes as already-consumed input notes. The PSWAP
+        /// correlator reads them via `note_updates.consumed_note_ids()`.
         ///
-        /// Uses `ConsumedUnauthenticatedLocal` (not `ConsumedExternal`)
-        /// because the test path inserts the record afresh — that variant
-        /// retains metadata, which `NoteUpdateTracker::insert_input_note`
-        /// requires to populate the by-nullifier index that
-        /// `consumed_nullifier_blocks()` iterates.
-        fn nullifier_window(entries: Vec<(&Note, u32)>) -> StateSyncUpdate {
+        /// `ConsumedUnauthenticatedLocal` is required (not
+        /// `ConsumedExternal`) because `NoteUpdateTracker::insert_input_note`
+        /// needs the metadata that variant retains.
+        fn consumed_notes_window(entries: Vec<(&Note, u32)>) -> StateSyncUpdate {
             use miden_client::account::AccountId;
             use miden_client::note::NoteDetails;
             use miden_client::store::InputNoteRecord;
@@ -1186,7 +1183,7 @@ mod tests {
 
             // P0 was consumed by Bob this sync.
             let p0_note = Note::from(pswap.clone());
-            observer.apply(&nullifier_window(vec![(&p0_note, 5)])).await?;
+            observer.apply(&consumed_notes_window(vec![(&p0_note, 5)])).await?;
 
             // 5. Assert: lineage in store advanced to depth 1.
             let lineage = store
@@ -1238,7 +1235,7 @@ mod tests {
             );
             observer.observe(&commit_note(&payback, &inclusion_proof)).await?;
             let p0_note = Note::from(pswap.clone());
-            observer.apply(&nullifier_window(vec![(&p0_note, 7)])).await?;
+            observer.apply(&consumed_notes_window(vec![(&p0_note, 7)])).await?;
 
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.current_depth, 1);
@@ -1260,7 +1257,7 @@ mod tests {
             // No notes emitted by reclaim → empty mock RPC, no `observe()` calls.
             let observer = PswapChainObserver::new(store.clone(), build_mock_rpc(vec![]));
             let p0_note = Note::from(pswap.clone());
-            observer.apply(&nullifier_window(vec![(&p0_note, 9)])).await?;
+            observer.apply(&consumed_notes_window(vec![(&p0_note, 9)])).await?;
 
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.state, PswapLineageState::Reclaimed);
@@ -1307,7 +1304,7 @@ mod tests {
 
             // BOTH P0 and the round-1 remainder are in the consumed window.
             let p0_note = Note::from(pswap.clone());
-            observer.apply(&nullifier_window(vec![
+            observer.apply(&consumed_notes_window(vec![
                 (&p0_note, 15),
                 (&remainder_1, 15),
             ])).await?;
@@ -1384,7 +1381,7 @@ mod tests {
             observer.observe(&commit_note(&foreign_payback, &inclusion_proof)).await?;
             // And the foreign PSWAP's nullifier is in the consumed window.
             let foreign_p0_note = Note::from(foreign.clone());
-            observer.apply(&nullifier_window(vec![(&foreign_p0_note, 5)])).await?;
+            observer.apply(&consumed_notes_window(vec![(&foreign_p0_note, 5)])).await?;
 
             // Store must remain empty — we never tracked this lineage.
             assert!(
@@ -1437,7 +1434,7 @@ mod tests {
             observer.observe(&commit_note(&stale_payback, &inclusion_proof)).await?;
             // NOTE: we deliberately do NOT include any nullifier — no new
             // round happened. Just a stale note replay.
-            observer.apply(&nullifier_window(vec![])).await?;
+            observer.apply(&consumed_notes_window(vec![])).await?;
 
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
             assert_eq!(lineage.current_depth, 1, "stale depth-1 must not re-advance to 2");
@@ -1475,7 +1472,7 @@ mod tests {
             );
             observer.observe(&commit_note(&zombie_payback, &inclusion_proof)).await?;
             let p0_note = Note::from(pswap.clone());
-            observer.apply(&nullifier_window(vec![(&p0_note, 30)])).await?;
+            observer.apply(&consumed_notes_window(vec![(&p0_note, 30)])).await?;
 
             // State unchanged: still FullyFilled at the same depth.
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();
@@ -1484,10 +1481,10 @@ mod tests {
             Ok(())
         }
 
-        // Note: the tampered-attachment security test was removed when the
-        // fail-loud commitment-mismatch check was deferred to phase 2 (see
-        // `reconstruct_payback` in pswap/discovery.rs). Re-introduce both
-        // when adding the malicious-node defense.
+        // Note: tampered-attachment security test deferred to phase 2 —
+        // the protocol's `payback_note` / `remainder_note` calls in
+        // pswap/discovery.rs don't yet verify the reconstructed id
+        // against the on-chain id. Re-introduce when adding that defense.
 
         /// Defensive fast-path: empty sync window AND empty pending → no
         /// store query, no RPC call, return Ok early. Verifies the
@@ -1500,8 +1497,8 @@ mod tests {
             store.upsert_pswap_lineage(&record).await?;
 
             let observer = PswapChainObserver::new(store.clone(), build_mock_rpc(vec![]));
-            // No observe() calls, empty nullifier window.
-            observer.apply(&nullifier_window(vec![])).await?;
+            // No observe() calls, empty consumed-notes window.
+            observer.apply(&consumed_notes_window(vec![])).await?;
 
             // Lineage untouched.
             let lineage = store.get_pswap_lineage(pswap.order_id()).await?.unwrap();

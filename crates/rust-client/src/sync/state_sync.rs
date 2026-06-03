@@ -170,11 +170,8 @@ pub struct StateSync {
     /// Responsible for checking the relevance of notes and executing the
     /// [`OnNoteReceived`] callback when a new note inclusion is received.
     note_screener: Arc<dyn OnNoteReceived>,
-    /// Side-effect-only per-note observers (see [`NoteObserver`]). Fanned
-    /// out alongside the screener verdict inside `note_state_sync`.
-    /// Errors are logged via `tracing::warn!` and do not abort sync.
-    /// Empty by default; populated by callers via
-    /// [`Self::with_note_observer`].
+    /// Per-note observers (see [`NoteObserver`]), invoked *before* the
+    /// screener verdict in `note_state_sync`. Empty by default.
     note_observers: Vec<Arc<dyn NoteObserver>>,
     /// Number of blocks after which pending transactions are considered stale and discarded.
     /// If `None`, there is no limit and transactions will be kept indefinitely.
@@ -209,17 +206,9 @@ impl StateSync {
         }
     }
 
-    /// Attaches a [`NoteObserver`] to this sync component.
-    ///
-    /// Observers run in attachment order after the screener verdict for
-    /// each note. Errors returned from
-    /// [`NoteObserver::observe`](crate::sync::NoteObserver::observe) are
-    /// logged via `tracing::warn!` (tagged with the observer's
-    /// [`name`](crate::sync::NoteObserver::name)) and never abort sync.
-    ///
-    /// Several observers may be attached to the same `StateSync`; each
-    /// is invoked independently and ordering between observers is not
-    /// guaranteed beyond attachment order.
+    /// Attaches a [`NoteObserver`] to this sync component. Observers run
+    /// in attachment order *before* the screener verdict; failures are
+    /// logged (tagged with [`NoteObserver::name`]) and never abort sync.
     #[must_use]
     pub fn with_note_observer(mut self, observer: Arc<dyn NoteObserver>) -> Self {
         self.note_observers.push(observer);

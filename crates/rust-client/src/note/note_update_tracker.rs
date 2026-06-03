@@ -23,7 +23,7 @@ use miden_tx::utils::serde::{
 
 use crate::ClientError;
 use crate::rpc::domain::note::CommittedNote;
-use crate::store::{InputNoteRecord, OutputNoteRecord, OutputNoteState};
+use crate::store::{InputNoteRecord, InputNoteState, OutputNoteRecord, OutputNoteState};
 use crate::transaction::{TransactionRecord, TransactionStatus};
 
 // NOTE CONSUMPTION
@@ -333,15 +333,9 @@ impl NoteUpdateTracker {
             .map(|(note_id, _)| *note_id)
     }
 
-    /// `NoteId`s of every input + output note that just transitioned to a
-    /// consumed state this sync. Downstream consumers (e.g. PSWAP chain
-    /// tracking) use this to find their tracked notes' consumption events
-    /// — filtered to true positives, no 16-bit-prefix-collision noise from
-    /// the raw `sync_nullifiers` RPC response.
-    ///
-    /// Both `input_notes` and `output_notes` are keyed by `NoteId`, so we
-    /// just iterate the map keys directly — no nullifier reverse-lookup
-    /// needed.
+    /// `NoteId`s of every input + output note that transitioned to a
+    /// consumed state this sync. True positives only — no 16-bit-prefix
+    /// noise from the raw `sync_nullifiers` RPC.
     pub fn consumed_note_ids(&self) -> impl Iterator<Item = NoteId> + '_ {
         let input = self.input_notes.iter().filter_map(|(note_id, update)| {
             if !matches!(
@@ -352,7 +346,14 @@ impl NoteUpdateTracker {
             ) {
                 return None;
             }
-            update.inner().state().consumed_block_height()?;
+            if !matches!(
+                update.inner().state(),
+                InputNoteState::ConsumedAuthenticatedLocal(_)
+                    | InputNoteState::ConsumedUnauthenticatedLocal(_)
+                    | InputNoteState::ConsumedExternal(_)
+            ) {
+                return None;
+            }
             Some(*note_id)
         });
         let output = self.output_notes.iter().filter_map(|(note_id, update)| {

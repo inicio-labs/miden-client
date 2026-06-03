@@ -333,17 +333,19 @@ impl NoteUpdateTracker {
             .map(|(note_id, _)| *note_id)
     }
 
-    /// `(nullifier, consumed-at-block)` for every input + output note that
-    /// just transitioned to a consumed state this sync. Downstream consumers
-    /// (e.g. PSWAP chain tracking) use this in place of the raw
-    /// `sync_nullifiers` RPC response — filtered to true positives, no
-    /// 16-bit-prefix-collision noise.
+    /// Nullifiers of every input + output note that just transitioned to a
+    /// consumed state this sync. Downstream consumers (e.g. PSWAP chain
+    /// tracking) use this in place of the raw `sync_nullifiers` RPC
+    /// response — filtered to true positives, no 16-bit-prefix-collision
+    /// noise. The per-note consumed-at block is available via
+    /// `record.state().consumed_block_height()` if a consumer needs it;
+    /// most consumers can use the sync's terminal `block_num` instead.
     ///
     /// For input notes the nullifier is looked up via the by-nullifier index
     /// rather than via `record.nullifier()` — once a note transitions to
     /// `ConsumedExternal`, its metadata (and thus its directly-derived
     /// nullifier) is gone, but the index entry persists.
-    pub fn consumed_nullifier_blocks(&self) -> impl Iterator<Item = (Nullifier, BlockNumber)> + '_ {
+    pub fn consumed_nullifiers(&self) -> impl Iterator<Item = Nullifier> + '_ {
         let input = self.input_notes_by_nullifier.iter().filter_map(|(nullifier, note_id)| {
             let update = self.input_notes.get(note_id)?;
             if !matches!(
@@ -354,19 +356,17 @@ impl NoteUpdateTracker {
             ) {
                 return None;
             }
-            let block = update.inner().state().consumed_block_height()?;
-            Some((*nullifier, block))
+            update.inner().state().consumed_block_height()?;
+            Some(*nullifier)
         });
         let output = self.output_notes.values().filter_map(|update| {
             if !matches!(update.update_type, NoteUpdateType::Insert | NoteUpdateType::Update) {
                 return None;
             }
-            let block = match update.inner().state() {
-                OutputNoteState::Consumed { block_height, .. } => Some(*block_height),
-                _ => None,
-            }?;
-            let nullifier = update.inner().nullifier()?;
-            Some((nullifier, block))
+            if !matches!(update.inner().state(), OutputNoteState::Consumed { .. }) {
+                return None;
+            }
+            update.inner().nullifier()
         });
         input.chain(output)
     }

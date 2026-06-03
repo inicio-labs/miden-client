@@ -8,7 +8,7 @@
 //! protocol repo (`crates/miden-testing/tests/scripts/pswap.rs`) for the
 //! executable contract this correlator implements at runtime.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -45,17 +45,18 @@ pub async fn discover_pswap_rounds(
     state_sync_update: &StateSyncUpdate,
     chain_note_updates: &[PswapChainNoteUpdate],
 ) -> Result<Vec<PswapLineageRoundUpdate>, ClientError> {
-    let nullifier_to_block: BTreeMap<Nullifier, BlockNumber> =
-        state_sync_update.note_updates.consumed_nullifier_blocks().collect();
+    let consumed_nullifiers: BTreeSet<Nullifier> =
+        state_sync_update.note_updates.consumed_nullifiers().collect();
 
-    if nullifier_to_block.is_empty() && chain_note_updates.is_empty() {
+    if consumed_nullifiers.is_empty() && chain_note_updates.is_empty() {
         return Ok(Vec::new());
     }
 
     // Load only lineages whose tip is in this sync window.
-    let consumed_nullifiers: Vec<Nullifier> = nullifier_to_block.keys().copied().collect();
     let active_lineages = store
-        .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(consumed_nullifiers))
+        .list_pswap_lineages(PswapLineageFilter::ActiveByTipNullifiers(
+            consumed_nullifiers.iter().copied().collect(),
+        ))
         .await?;
     if active_lineages.is_empty() {
         return Ok(Vec::new());
@@ -71,20 +72,22 @@ pub async fn discover_pswap_rounds(
             .push(note);
     }
 
+    // All rounds discovered this sync share the sync's terminal block.
+    let sync_block = state_sync_update.block_num;
     let mut round_updates: Vec<PswapLineageRoundUpdate> = Vec::new();
 
     for lineage_record in active_lineages {
         let mut lineage = lineage_record;
 
-        // Same-block multi-fill: re-check the new tip's nullifier each step.
-        while let Some(&at_block_num) = nullifier_to_block.get(&lineage.current_tip_nullifier) {
+        // Same-block multi-fill: re-check the new tip after each in-memory advance.
+        while consumed_nullifiers.contains(&lineage.current_tip_nullifier) {
             let round_depth = lineage.current_depth + 1;
             let notes = notes_by_order_depth
                 .get(&(lineage.order_id_key(), round_depth))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
 
-            let update = match build_round_update(&lineage, round_depth, at_block_num, notes) {
+            let update = match build_round_update(&lineage, round_depth, sync_block, notes) {
                 Ok(Some(u)) => u,
                 Ok(None) => break,
                 Err(err) => {

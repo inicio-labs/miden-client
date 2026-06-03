@@ -64,16 +64,14 @@ impl SqliteStore {
         conn: &mut Connection,
         filter: PswapLineageFilter,
     ) -> Result<Vec<PswapLineageRecord>, StoreError> {
-        // ActiveByTipNullifiers has a dynamic IN-list — handle separately so
-        // we don't bloat the prepared-statement cache with one entry per
-        // distinct nullifier-count value.
+        // `ActiveByTipNullifiers` has a dynamic IN-list — separate path avoids
+        // bloating the prepared-statement cache.
         if let PswapLineageFilter::ActiveByTipNullifiers(nullifiers) = &filter {
             return list_active_by_tip_nullifiers(conn, nullifiers);
         }
 
-        // Pull every row that matches the SQL-expressible part of the
-        // filter; the `ByCreator` variant is applied in Rust because the
-        // creator is embedded in the serialised `original_pswap` blob.
+        // `ByCreator` is filtered in Rust because the creator lives inside
+        // the serialised `original_pswap` blob, not in its own column.
         let sql_filter = sql_filter_part(&filter);
         let full_sql = std::format!("{SELECT_LINEAGE_COLUMNS_PREFIX}{sql_filter}");
         let mut stmt = conn.prepare_cached(&full_sql).into_store_error()?;
@@ -89,9 +87,7 @@ impl SqliteStore {
             PswapLineageFilter::ByOrderId(order_id) => {
                 collect_rows(stmt.query(params![order_id.to_bytes()]).into_store_error()?)?
             },
-            PswapLineageFilter::ActiveByTipNullifiers(_) => unreachable!(
-                "ActiveByTipNullifiers is handled by the early-return above"
-            ),
+            PswapLineageFilter::ActiveByTipNullifiers(_) => unreachable!("handled above"),
         };
 
         Ok(rows)
@@ -103,13 +99,13 @@ impl SqliteStore {
     ) -> Result<(), StoreError> {
         let tx = conn.transaction().into_store_error()?;
 
-        // 1. Mutate the lineage row in place.
+        // 1. Mutate the lineage row.
         update_lineage_tip_tx(&tx, &update)?;
 
-        // 2a. Insert the reconstructed payback (if any). See
-        //     `insert_pswap_round_note_tx` for the "skip if already present"
-        //     rationale (protects the screener's richer Committed row for
-        //     public notes; the only insertion site for private notes).
+        // 2. Insert payback + remainder into `input_notes`. See
+        //    `insert_pswap_round_note_tx` for the skip-if-present rationale.
+        //    The remainder insert ensures round-N+1 detection works for
+        //    private PSWAPs (screener can't see private content).
         if let Some(payback_note) = &update.payback {
             insert_pswap_round_note_tx(
                 &tx,
@@ -118,17 +114,6 @@ impl SqliteStore {
                 update.at_block,
             )?;
         }
-
-        // 2b. Insert the reconstructed remainder (if any) — mirrors the
-        //     payback handling. The remainder is the lineage's NEW TIP;
-        //     its nullifier must be in `unspent_nullifiers()` for
-        //     standard nullifier sync to detect round N+1's consumption.
-        //     The default `NoteScreener` covers this for PUBLIC PSWAPs
-        //     via the asset-pair tag, but for PRIVATE PSWAPs the screener
-        //     cannot inspect the content and Discards. The explicit
-        //     insert here is the belt-and-suspenders mechanism so private-
-        //     PSWAP round detection works at depth 2+ (depth 1 still
-        //     blocked by the observer stub; see `pswap/observer.rs`).
         if let Some(remainder_note) = &update.remainder {
             insert_pswap_round_note_tx(
                 &tx,
@@ -138,14 +123,9 @@ impl SqliteStore {
             )?;
         }
 
-        // 3. Terminal-state tag cleanup. The asset-pair tag registered at
-        //    lineage creation (see `Client::record_created_pswap_lineages`)
-        //    keeps sync fetching notes for the pair on this client's
-        //    behalf. Once the lineage is `FullyFilled` or `Reclaimed` we
-        //    no longer want those notes — drop the tag in the same
-        //    transaction so a crash between the lineage update and the
-        //    tag delete cannot leave us with a terminal lineage that is
-        //    still paying sync bandwidth.
+        // 3. Drop the asset-pair tag on terminal states (same tx — crash
+        //    between row update and tag delete would leave a terminal
+        //    lineage paying sync bandwidth).
         if matches!(
             update.state,
             PswapLineageState::FullyFilled | PswapLineageState::Reclaimed
@@ -157,10 +137,9 @@ impl SqliteStore {
     }
 }
 
-/// Removes the `(asset_pair_tag, Subscription(original_note_id))` row in
-/// `tags` for the given lineage. Deserialises the row's `original_pswap`
-/// to recompute the tag AND the original NoteId (neither is carried on
-/// the round update). Idempotent.
+/// Removes the `(asset_pair_tag, Subscription(original_note_id))` row.
+/// Recomputes the tag and original NoteId from the persisted PSWAP blob
+/// (neither is carried on the round update). Idempotent.
 fn remove_pswap_asset_pair_tag_tx(
     tx: &Transaction<'_>,
     order_id: Felt,
@@ -216,13 +195,9 @@ fn sql_filter_part(filter: &PswapLineageFilter) -> &'static str {
 }
 
 /// Loads `Active` lineages whose `current_tip_nullifier` is in `nullifiers`.
-///
-/// Builds an `IN (?, ?, …)` clause with one placeholder per nullifier.
-/// SQLite's default parameter limit is 32 766; typical sync nullifier
-/// windows are well under that (≤ a few hundred), so we don't bother
-/// chunking. Uses `prepare` (not `prepare_cached`) because the SQL string
-/// varies with N — caching would bloat the statement cache with one entry
-/// per distinct window size.
+/// SQLite's default param limit (32 766) dwarfs typical sync windows; we
+/// don't chunk. `prepare` (not `prepare_cached`) keeps per-N SQL out of
+/// the cache.
 fn list_active_by_tip_nullifiers(
     conn: &mut Connection,
     nullifiers: &[Nullifier],
@@ -335,18 +310,9 @@ fn update_lineage_tip_tx(
 ) -> Result<(), StoreError> {
     let order_id_bytes = update.order_id.to_bytes();
 
-    // Fetch the row's current depth in the same transaction. This serves
-    // two purposes:
-    //   1. Confirms the lineage exists (a missing row indicates the
-    //      correlator emitted a round update for an order this store
-    //      never tracked — almost certainly a correlator bug).
-    //   2. Enforces the monotonic-depth invariant: every round must
-    //      advance by exactly 1. The store is the last line of defense
-    //      against off-by-one or duplicate-delivery bugs in the
-    //      correlator; silently writing a wrong depth would corrupt the
-    //      reconstruction chain (every subsequent
-    //      `PswapNote::payback_note` / `remainder_note` call depends on
-    //      `current_depth + 1` being the round that produced the tip).
+    // Confirm the row exists AND enforce the monotonic-depth invariant
+    // (every round must advance by exactly 1). The store is the last line
+    // of defense against correlator off-by-ones / duplicate deliveries.
     const DEPTH_SQL: &str = "SELECT current_depth FROM pswap_lineages WHERE order_id = ?";
     let current_depth: Option<u32> = tx
         .prepare_cached(DEPTH_SQL)
@@ -423,21 +389,10 @@ WHERE order_id = ?";
     Ok(())
 }
 
-/// Inserts a reconstructed PSWAP-round note (payback or remainder) into
-/// `input_notes`, skipping if a row already exists for the same `note_id`.
-///
-/// Why skip-if-present rather than upsert: for **public** notes the default
-/// `NoteScreener` will already have inserted this `note_id` in `Committed`
-/// state earlier in the same sync round, with a valid inclusion proof. The
-/// downstream `upsert_input_note_tx` is `INSERT OR REPLACE`, so calling it
-/// unconditionally would downgrade the screener's `Committed` row back to
-/// `Unverified` — the note would not be consumable until the next sync
-/// re-upgraded it. For **private** notes the screener Discards and there
-/// is no prior row, so this is the only insertion site.
-///
-/// Attachments are taken from the note itself: a payback is a P2ID with no
-/// attachments (`NoteAttachments::default()`); a remainder is a PSWAP
-/// carrying its own attachment word.
+/// Inserts a reconstructed payback or remainder into `input_notes`. Skips
+/// if a row for the same `note_id` already exists — for public notes the
+/// screener has already inserted a `Committed` row that's richer than
+/// ours; for private notes this is the only insertion site.
 fn insert_pswap_round_note_tx(
     tx: &Transaction<'_>,
     note: &Note,
@@ -462,11 +417,9 @@ fn insert_pswap_round_note_tx(
     let details = miden_client::note::NoteDetails::from(note.clone());
     let attachments = note.attachments().clone();
 
-    // Prefer `Unverified` state — it carries the inclusion proof, which the
-    // sync state-promotion path turns into `Committed` on the next run
-    // without re-fetching from the node. Fall back to `Expected` if no
-    // proof was supplied (defensive only — reclaim emits no notes so this
-    // function isn't called on reclaim rounds).
+    // `Unverified` carries the proof — sync's state-promotion path turns it
+    // into `Committed` next run. `Expected` fallback is defensive only
+    // (reclaim emits no notes, so this never runs without a proof).
     let record = match inclusion_proof {
         Some(proof) => InputNoteRecord::new(
             details,
@@ -520,10 +473,8 @@ mod tests {
     use super::*;
     use crate::tests::create_test_store;
 
-    /// Standalone copy of `crate::pswap::lineage::test_helpers` —
-    /// `pub(crate)` does not cross crate boundaries, so the SQLite
-    /// store tests reproduce the small factory rather than depending
-    /// on a feature-gated export.
+    /// Standalone copy of `pswap::lineage::test_helpers` —
+    /// `pub(crate)` doesn't cross crates.
     fn build_test_pswap(offered_amount: u64, requested_amount: u64) -> PswapNote {
         let sender =
             AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
@@ -570,11 +521,8 @@ mod tests {
         }
     }
 
-    /// Round-trip a `PswapLineageRecord` through the SQLite store.
-    /// This is the most failure-prone serde path (the `original_pswap`
-    /// blob goes through `Note::to_bytes` -> `Note::read_from_bytes`
-    /// -> `PswapNote::try_from(&note)`). Any drift in the protocol's
-    /// PswapNote shape will fail this test before reaching production.
+    /// Round-trips a record through SQLite — catches drift in the
+    /// `Note::to_bytes` ↔ `PswapNote::try_from(&note)` serde path.
     #[tokio::test]
     async fn lineage_round_trip_via_sqlite_store() -> anyhow::Result<()> {
         let store = create_test_store().await;
@@ -604,10 +552,7 @@ mod tests {
         Ok(())
     }
 
-    /// `apply_pswap_round` must reject a `round_depth` that does not
-    /// equal `current_depth + 1`. This is the monotonic-depth invariant
-    /// added in commit 53902048 — the store is the last line of defense
-    /// against correlator off-by-ones or duplicate deliveries.
+    /// `round_depth` must equal `current_depth + 1` (monotonic-depth invariant).
     #[tokio::test]
     async fn apply_pswap_round_rejects_non_monotonic_depth() -> anyhow::Result<()> {
         let store = create_test_store().await;
@@ -657,10 +602,7 @@ mod tests {
         Ok(())
     }
 
-    /// `apply_pswap_round` must error when called against an `order_id`
-    /// that does not exist in the lineage table. This catches
-    /// correlator bugs that emit a round update for an order this
-    /// client never tracked.
+    /// Unknown `order_id` must error (catches correlator bugs).
     #[tokio::test]
     async fn apply_pswap_round_rejects_unknown_order_id() -> anyhow::Result<()> {
         let store = create_test_store().await;
@@ -697,8 +639,7 @@ mod tests {
         Ok(())
     }
 
-    /// `list_pswap_lineages` honours the `Active` filter — terminal
-    /// states are excluded.
+    /// `Active` filter excludes terminal states.
     #[tokio::test]
     async fn list_pswap_lineages_filters_by_state() -> anyhow::Result<()> {
         let store = create_test_store().await;
@@ -733,9 +674,8 @@ mod tests {
         Ok(())
     }
 
-    /// `list_pswap_lineages(ActiveByTipNullifiers(...))` returns only Active
-    /// lineages whose `current_tip_nullifier` is in the given set, and is
-    /// well-behaved for empty input + non-matching input.
+    /// `ActiveByTipNullifiers` returns matching Active lineages only;
+    /// well-behaved for empty + non-matching inputs.
     #[tokio::test]
     async fn list_pswap_lineages_filters_by_tip_nullifiers() -> anyhow::Result<()> {
         let store = create_test_store().await;

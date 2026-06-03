@@ -36,28 +36,24 @@ use crate::sync::StateSyncUpdate;
 // PUBLIC ENTRY POINT
 // -----------------------------------------------------------------------------
 
-/// Returns one [`PswapLineageRoundUpdate`] per round advanced this sync,
-/// in apply order. For each active lineage whose tip nullifier appears in
-/// the sync's consumed-nullifier window, looks up the round's notes by
-/// `(order_id, depth)`, classifies payback vs remainder by tag, and
-/// builds the round update. Loops on the new tip to catch same-block
-/// multi-fill. Returns empty when the sync had no PSWAP activity.
+/// Returns one [`PswapLineageRoundUpdate`] per round advanced this sync.
+/// For each active lineage whose tip nullifier is in the consumed-window,
+/// looks up the round's notes by `(order_id, depth)`, classifies them by
+/// tag, and builds the round update. Inner loop catches same-block
+/// multi-fill via in-memory advancement.
 pub async fn discover_pswap_rounds(
     store: Arc<dyn Store>,
     state_sync_update: &StateSyncUpdate,
     chain_note_updates: &[PswapChainNoteUpdate],
 ) -> Result<Vec<PswapLineageRoundUpdate>, ClientError> {
+    // Most syncs have no PSWAP activity — skip the store query.
     if state_sync_update.current_window_nullifier_blocks.is_empty()
         && chain_note_updates.is_empty()
     {
-        // Most syncs hit this path. Skip the store query.
         return Ok(Vec::new());
     }
 
-    // Load only lineages whose tip nullifier appears in this sync window —
-    // skips the "scan every active lineage" cost when activity is sparse.
-    // The inner same-block multi-fill loop below handles subsequent rounds
-    // for each loaded lineage via in-memory advancement.
+    // Load only lineages whose tip is in this sync window.
     let consumed_nullifiers: Vec<Nullifier> = state_sync_update
         .current_window_nullifier_blocks
         .iter()
@@ -70,9 +66,7 @@ pub async fn discover_pswap_rounds(
         return Ok(Vec::new());
     }
 
-    // Group observed notes by (order_id, depth) for O(1) per-round lookup.
-    // `or_insert_with(Vec::new)` (vs `or_default`) makes the default value
-    // explicit at the call site.
+    // Group notes by (order_id, depth) for O(1) per-round lookup.
     let mut notes_by_order_depth: BTreeMap<(OrderIdKey, u32), Vec<&PswapChainNoteUpdate>> =
         BTreeMap::new();
     for note in chain_note_updates {
@@ -82,8 +76,7 @@ pub async fn discover_pswap_rounds(
             .push(note);
     }
 
-    // Index the consumed-nullifier window for fast tip-lookup. Duplicate
-    // nullifiers collapse to first observation (correlator is per-round).
+    // Tip-nullifier → block-of-consumption.
     let nullifier_to_block: BTreeMap<Nullifier, BlockNumber> = state_sync_update
         .current_window_nullifier_blocks
         .iter()
@@ -95,9 +88,7 @@ pub async fn discover_pswap_rounds(
     for lineage_record in active_lineages {
         let mut lineage = lineage_record;
 
-        // Walk forward through every round consumed this sync — the inner
-        // loop catches same-block multi-fill (batched fills landing in
-        // one block) by re-checking the new tip's nullifier.
+        // Same-block multi-fill: re-check the new tip's nullifier each step.
         while let Some(&at_block_num) = nullifier_to_block.get(&lineage.current_tip_nullifier) {
             let round_depth = lineage.current_depth + 1;
             let notes = notes_by_order_depth
@@ -131,8 +122,7 @@ pub async fn discover_pswap_rounds(
 // PER-ROUND CLASSIFICATION
 // -----------------------------------------------------------------------------
 
-/// Builds a [`PswapLineageRoundUpdate`] for one round advance of `lineage`.
-/// `Err(_)` on reconstruction or commitment-parity failures (fail-loud).
+/// Builds one round's [`PswapLineageRoundUpdate`].
 fn build_round_update(
     lineage: &PswapLineageRecord,
     round_depth: u32,
@@ -142,24 +132,16 @@ fn build_round_update(
     let original = &lineage.original_pswap;
     let offered_faucet = original.offered_asset().faucet_id();
     let requested_faucet = original.storage().requested_asset().faucet_id();
-    let zero_offered = FungibleAsset::new(offered_faucet, 0)
-        .expect("FungibleAsset(faucet, 0) is always valid");
-    let zero_requested = FungibleAsset::new(requested_faucet, 0)
-        .expect("FungibleAsset(faucet, 0) is always valid");
-    // Each chain-note-update carries an AssetAmount. The faucet context is
-    // implicit from which slot of the PSWAP it represents: payback amounts
-    // live in the REQUESTED faucet (fill amount), remainder amounts in the
-    // OFFERED faucet (payout amount). The two short helpers below pin those
-    // mappings explicitly.
-    let to_fill =
-        |amount: AssetAmount| FungibleAsset::new(requested_faucet, u64::from(amount));
-    let to_payout =
-        |amount: AssetAmount| FungibleAsset::new(offered_faucet, u64::from(amount));
+    let zero_offered = FungibleAsset::new(offered_faucet, 0).expect("FA(_, 0) is always valid");
+    let zero_requested = FungibleAsset::new(requested_faucet, 0).expect("FA(_, 0) is always valid");
+    // Payback amounts live in the requested faucet (fill); remainder amounts
+    // in the offered faucet (payout).
+    let to_fill = |amount: AssetAmount| FungibleAsset::new(requested_faucet, u64::from(amount));
+    let to_payout = |amount: AssetAmount| FungibleAsset::new(offered_faucet, u64::from(amount));
 
     match notes.len() {
         0 => {
-            // Reclaim: only the creator can consume via the cancel branch,
-            // which emits no outputs.
+            // Reclaim — cancel branch emits no outputs; only the creator can hit it.
             Ok(Some(PswapLineageRoundUpdate {
                 order_id: lineage.order_id(),
                 round_depth,
@@ -179,8 +161,7 @@ fn build_round_update(
             }))
         },
         1 => {
-            // Full fill — only a payback was emitted. By definition, all
-            // remaining requested has been consumed → remaining_requested = 0.
+            // Full fill — only payback emitted; remaining_requested → 0.
             let payback_note_update = notes[0];
             let payback = reconstruct_payback(original, payback_note_update, round_depth)?;
             let fill_amount = to_fill(payback_note_update.amount)
@@ -221,8 +202,7 @@ fn build_round_update(
             let payout_amount = to_payout(remainder_note_update.amount)
                 .map_err(ClientError::AssetError)?;
 
-            // Saturating sub: clamp to zero on over-fill (preserves v1
-            // "round off rather than refuse to apply" semantics).
+            // Saturating sub — clamp to zero on over-fill.
             let remaining_requested = lineage.remaining_requested.sub(fill_amount)
                 .unwrap_or(zero_requested);
             let remaining_offered = lineage.remaining_offered.sub(payout_amount)
@@ -241,11 +221,7 @@ fn build_round_update(
                     remaining_requested.amount(),
                 )
                 .map_err(PswapLineageError::Reconstruction)?;
-            // Phase 1: no on-chain-id verification (see reconstruct_payback's
-            // doc). The protocol guarantees deterministic reconstruction, so
-            // we trust the result. Phase 2 hardening can add the id-match
-            // check here too.
-
+            // Phase 1: no id-match verification (see `reconstruct_payback`).
             let tip_nullifier = remainder_note.nullifier();
 
             Ok(Some(PswapLineageRoundUpdate {
@@ -266,19 +242,13 @@ fn build_round_update(
                 remainder_inclusion_proof: Some(remainder_note_update.inclusion_proof.clone()),
             }))
         },
-        // Protocol invariant: a PSWAP round emits 0, 1, or 2 notes.
-        _ => unreachable!("PSWAP emits at most 2 notes per (order_id, depth)"),
+        _ => unreachable!("PSWAP emits ≤ 2 notes per (order_id, depth)"),
     }
 }
 
-/// Reconstructs the payback note from its observed metadata.
-///
-/// **Phase 1**: the fail-loud commitment-mismatch check (verifying the
-/// reconstructed id matches the on-chain id) is intentionally NOT
-/// performed here. Phase 2 hardening can re-introduce that check to
-/// defend against malicious-node tampering / protocol-client version
-/// skew; until then we trust the protocol-side reconstruction is
-/// byte-identical to the on-chain shape.
+/// Reconstructs the payback note. Phase 1 does NOT verify the
+/// reconstructed id matches the on-chain id — phase 2 hardening can add
+/// that defence against malicious-node tampering.
 fn reconstruct_payback(
     original: &PswapNote,
     note_update: &PswapChainNoteUpdate,
@@ -296,11 +266,9 @@ fn reconstruct_payback(
 // -----------------------------------------------------------------------------
 
 impl PswapLineageRecord {
-    /// Applies a [`PswapLineageRoundUpdate`] to a copy of this record
-    /// in memory, returning the post-round version. Used by the
-    /// correlator's same-block multi-fill loop, which needs to advance
-    /// through several rounds in a single sync iteration without
-    /// writing to the store in between.
+    /// Applies an update in memory (returns the post-round version).
+    /// Used by the same-block multi-fill loop to advance through several
+    /// rounds without writing to the store between them.
     pub(crate) fn apply_round_in_memory(
         mut self,
         update: &PswapLineageRoundUpdate,
@@ -326,14 +294,9 @@ impl PswapLineageRecord {
 
 #[cfg(test)]
 mod tests {
-    //! Per-round correlator tests. Exercise [`build_round_update`] and the
-    //! in-memory multi-fill advance directly — they own the deterministic
-    //! correctness story; the store layer is mocked via fresh records.
-    //!
-    //! Every chain-note-update built here uses an actual reconstructed
-    //! `PswapNote::payback_note(...)` / `remainder_note(...)` for its
-    //! `note_id`, so the correlator's reconstruction-parity check goes
-    //! through the same code path that runs in production.
+    //! Correlator tests — exercise `build_round_update` + the in-memory
+    //! multi-fill advance directly. Chain note updates use real
+    //! `PswapNote::payback_note` / `remainder_note` reconstructions.
     use alloc::vec;
     use alloc::vec::Vec;
 

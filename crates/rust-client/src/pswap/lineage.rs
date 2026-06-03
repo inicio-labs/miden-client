@@ -52,64 +52,42 @@ impl PswapLineageState {
 // PSWAP LINEAGE RECORD
 // ================================================================================================
 
-/// Persistent record of one PSWAP order's chain state.
-///
-/// The `original_pswap` field is the source of truth for every immutable
-/// "initial" detail: creator/sender, offered and requested assets, serial
-/// number, note types. Access them via the convenience accessors below
-/// ([`Self::order_id`], [`Self::creator_account_id`], [`Self::offered_asset`],
-/// etc.) which delegate to [`PswapNote`]'s getters — no duplicate fields on
-/// this record.
-///
-/// The mutable fields describe the live tip and per-round bookkeeping needed
-/// to reconstruct it.
+/// Persistent record of one PSWAP order's chain state. Immutable details
+/// (creator, assets, serial number, note types) live on `original_pswap`;
+/// the accessors below delegate to it.
 #[derive(Debug, Clone)]
 pub struct PswapLineageRecord {
-    /// The originating [`PswapNote`] at depth 0. The source of truth for
-    /// every immutable "initial" field. Serialised into the
-    /// `pswap_lineages.original_pswap` column.
+    /// Source of truth for every immutable "initial" field.
     pub original_pswap: PswapNote,
 
-    /// Note ID of the current live tip. Equal to `original_pswap.id()` when
-    /// `current_depth == 0`; otherwise the ID of a remainder this client did
-    /// not originate (reconstructible via
-    /// [`PswapNote::remainder_note`] with the `last_*` fields below).
+    /// Current tip's note id. Equals `original_pswap.id()` at depth 0;
+    /// otherwise a remainder we didn't originate.
     pub current_tip_note_id: NoteId,
-    /// Nullifier of the current tip. Indexed in SQLite so the per-note
-    /// observer can match incoming consumed-nullifier events against active
-    /// lineages with a single query.
+    /// Current tip's nullifier. Indexed for fast lookup during sync.
     pub current_tip_nullifier: Nullifier,
-    /// 0 for the original tip; increments by 1 each round. Matches the
-    /// protocol's `PswapNoteAttachment::depth()` (u32).
+    /// 0 for the original tip; +1 per round. Matches `PswapNoteAttachment::depth()`.
     pub current_depth: u32,
-    /// Offered-asset balance still unfilled. Decreases by per-round
-    /// `payout_amount`. Same faucet as `original_pswap.offered_asset()`;
-    /// the amount is what SQLite persists, the faucet is derived from
-    /// `original_pswap` on every read.
+    /// Offered-asset balance still unfilled (same faucet as
+    /// `original_pswap.offered_asset()`; SQL stores just the amount).
     pub remaining_offered: FungibleAsset,
-    /// Requested-asset balance still unfilled. Decreases by per-round
-    /// `fill_amount`. Same faucet as `original_pswap.requested_asset()`.
+    /// Requested-asset balance still unfilled.
     pub remaining_requested: FungibleAsset,
 
-    /// Current lifecycle state — see [`PswapLineageState`].
     pub state: PswapLineageState,
-    /// Block number at which the original PSWAP was submitted; useful for
-    /// debugging and UI.
+    /// Block the original PSWAP was submitted in.
     pub created_at_block: BlockNumber,
-    /// Block number of the most recent state-mutating round. Equals
-    /// `created_at_block` immediately after creation.
+    /// Block of the most recent state-mutating round.
     pub updated_at_block: BlockNumber,
 }
 
 impl PswapLineageRecord {
-    /// `order_id == original_pswap.serial[1]` — the stable identifier shared
-    /// by every note in the chain, surfaced in attachment word slot `[1]`.
+    /// Stable identifier (== `original_pswap.serial[1]`) shared by every
+    /// note in the chain.
     pub fn order_id(&self) -> Felt {
         self.original_pswap.order_id()
     }
 
-    /// `order_id()` wrapped in the `Ord`/`Eq`-compatible
-    /// [`crate::pswap::types::OrderIdKey`] for use as a `BTreeMap` key.
+    /// `order_id()` wrapped as a `BTreeMap`-compatible key.
     pub(crate) fn order_id_key(&self) -> super::types::OrderIdKey {
         super::types::OrderIdKey::from(self.order_id())
     }
@@ -119,54 +97,37 @@ impl PswapLineageRecord {
         Note::from(self.original_pswap.clone()).id()
     }
 
-    /// Account that created the order — recipient of every payback in the
-    /// chain.
+    /// Account that created the order (recipient of every payback).
     pub fn creator_account_id(&self) -> AccountId {
         self.original_pswap.storage().creator_account_id()
     }
 
-    /// Account that submitted the create transaction; equals
-    /// [`Self::creator_account_id`] in the v1 flow but the protocol does not
-    /// require it.
+    /// Submitter of the create transaction.
     pub fn sender_account_id(&self) -> AccountId {
         self.original_pswap.sender()
     }
 
-    /// Asset offered by the creator (and progressively paid out to fillers
-    /// as remainder amounts).
     pub fn offered_asset(&self) -> &FungibleAsset {
         self.original_pswap.offered_asset()
     }
 
-    /// Asset the creator wants in exchange (paid back to the creator across
-    /// rounds).
     pub fn requested_asset(&self) -> &FungibleAsset {
         self.original_pswap.storage().requested_asset()
     }
 
-    /// `NoteType` of the original PSWAP — also the type of every remainder
-    /// emitted along the chain.
     pub fn note_type(&self) -> NoteType {
         self.original_pswap.note_type()
     }
 
-    /// `NoteType` configured for the per-round P2ID payback notes.
     pub fn payback_note_type(&self) -> NoteType {
         self.original_pswap.storage().payback_note_type()
     }
 
-    /// Word containing the original PSWAP's serial number — needed to call
-    /// [`PswapNote::payback_note`] / [`PswapNote::remainder_note`] for
-    /// arbitrary depths.
     pub fn initial_serial_number(&self) -> Word {
         self.original_pswap.serial_number()
     }
 
-    /// Cached asset-pair tag — registered at lineage creation so sync
-    /// returns every remainder in this chain.
-    ///
-    /// Computed via [`PswapNote::create_tag`] from the immutable note type
-    /// and asset pair; deterministic and cheap.
+    /// Asset-pair tag — sync returns every remainder in this chain via it.
     pub fn asset_pair_tag(&self) -> NoteTag {
         PswapNote::create_tag(self.note_type(), self.offered_asset(), self.requested_asset())
     }
@@ -175,63 +136,42 @@ impl PswapLineageRecord {
 // PSWAP LINEAGE ROUND UPDATE
 // ================================================================================================
 
-/// One round's transition, produced by the post-sync correlator
-/// (`discover_pswap_rounds`) and applied atomically by
-/// `Store::apply_pswap_round`.
-///
-/// Every PSWAP lineage advances in rounds: a fill consumes the current tip
-/// and emits at most one payback + one remainder. A reclaim consumes the
-/// tip with no outputs. This struct captures one such transition end to
-/// end, including the reconstructed notes the correlator built and verified
-/// against the on-chain note IDs.
+/// One round's transition, produced by `discover_pswap_rounds` and applied
+/// atomically by `Store::apply_pswap_round`. Fill = payback + remainder
+/// (≤1 each); reclaim = no outputs.
 #[derive(Debug, Clone)]
 pub struct PswapLineageRoundUpdate {
-    /// Identifies which lineage this update targets.
     pub order_id: Felt,
-    /// `previous_depth + 1`. The protocol's PSWAP script stamps this in the
-    /// attachment word of every output note emitted in this round.
+    /// `previous_depth + 1`.
     pub round_depth: u32,
-    /// Account that consumed the previous tip and emitted the new outputs.
-    /// For a reclaim, equals the creator.
+    /// The consumer of the previous tip (creator for a reclaim).
     pub consumer_account_id: AccountId,
-    /// Requested-asset balance the consumer filled this round (same faucet
-    /// as `original_pswap.requested_asset()`).
+    /// Filled this round, in the requested faucet.
     pub fill_amount: FungibleAsset,
-    /// Offered-asset balance paid out to the consumer this round (same
-    /// faucet as `original_pswap.offered_asset()`).
+    /// Paid out this round, in the offered faucet.
     pub payout_amount: FungibleAsset,
-    /// Remaining offered-asset balance AFTER this round (0 on full fill / reclaim).
+    /// AFTER this round.
     pub remaining_offered: FungibleAsset,
-    /// Remaining requested-asset balance AFTER this round (0 on full fill / reclaim).
+    /// AFTER this round.
     pub remaining_requested: FungibleAsset,
-    /// Lineage state AFTER this round: `Active` if a remainder was emitted,
-    /// `FullyFilled` if requested side exhausted, `Reclaimed` if consumer == creator
-    /// with no outputs.
+    /// State AFTER this round.
     pub state: PswapLineageState,
-    /// Identity of the new tip (the remainder). `None` for terminal rounds.
+    /// New tip (remainder). `None` for terminal rounds.
     pub tip_note_id: Option<NoteId>,
-    /// Nullifier of the new tip. `None` for terminal rounds.
     pub tip_nullifier: Option<Nullifier>,
-    /// Block in which the previous tip was consumed.
+    /// Block the previous tip was consumed in.
     pub at_block: BlockNumber,
-    /// Reconstructed payback note (verified against the observed note id).
-    /// Inserted into `input_notes` so the creator's normal consume flow finds it.
-    /// `None` only on a reclaim round.
+    /// Reconstructed payback; inserted into `input_notes` by the store.
+    /// `None` only on reclaim.
     pub payback: Option<Note>,
-    /// Inclusion proof for `payback`. Threaded so the store can insert the
-    /// payback in `Unverified` state (skips the Expected-state limbo that
-    /// would otherwise strand a private payback). `None` iff `payback.is_none()`.
+    /// Inclusion proof for `payback` — lets the store insert it as
+    /// `Unverified` (carries the proof). `None` iff `payback.is_none()`.
     pub payback_inclusion_proof: Option<NoteInclusionProof>,
-    /// Reconstructed remainder note (verified against the observed note id).
-    /// Inserted into `input_notes` by `apply_pswap_round` so the remainder's
-    /// nullifier is tracked by the standard nullifier-sync mechanism — needed
-    /// for round N+1 detection, especially for private PSWAPs where the
-    /// default `NoteScreener` doesn't pick the remainder up via the asset-pair
-    /// tag. `None` for terminal rounds.
+    /// Reconstructed remainder; inserted into `input_notes` so its
+    /// nullifier is tracked for round N+1 detection. `None` for terminal
+    /// rounds.
     pub remainder: Option<Note>,
-    /// Inclusion proof for `remainder`. Threaded so the store can insert the
-    /// remainder in `Unverified` state (same rationale as
-    /// `payback_inclusion_proof`). `None` iff `remainder.is_none()`.
+    /// `None` iff `remainder.is_none()`.
     pub remainder_inclusion_proof: Option<NoteInclusionProof>,
 }
 
@@ -241,19 +181,13 @@ pub struct PswapLineageRoundUpdate {
 /// Filter for [`crate::store::Store::list_pswap_lineages`].
 #[derive(Debug, Clone)]
 pub enum PswapLineageFilter {
-    /// Return every row in the table.
     All,
-    /// Return only rows whose `state == PswapLineageState::Active`.
     Active,
-    /// Return rows whose `creator_account_id` matches.
     ByCreator(AccountId),
-    /// Return at most one row whose `order_id` matches.
     ByOrderId(Felt),
-    /// Return Active rows whose `current_tip_nullifier` is in the given set.
-    /// Empty input returns no rows. Used by the sync correlator to load only
-    /// the lineages whose tip was consumed in this sync window — avoids the
-    /// "load every active lineage" scan when activity is sparse. See
-    /// [`crate::pswap::discovery::discover_pswap_rounds`].
+    /// Active rows whose `current_tip_nullifier` is in the given set.
+    /// Empty input returns no rows. Used by `discover_pswap_rounds` to
+    /// load only the lineages whose tip was consumed this sync.
     ActiveByTipNullifiers(Vec<Nullifier>),
 }
 

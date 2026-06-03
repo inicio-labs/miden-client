@@ -1,23 +1,14 @@
-//! PSWAP chain tracking — follows partial-swap orders across fills by
-//! foreign accounts so the creator can always see the current tip and
-//! reclaim the unfilled balance.
+//! PSWAP chain tracking — follows partial-swap orders across fills so the
+//! creator can always see the current tip and reclaim the unfilled balance.
 //!
-//! ### Flow
+//! Flow:
+//! 1. Create → [`PswapLineageRecord`] row + asset-pair tag subscription.
+//! 2. Sync → [`PswapChainObserver`] collects PSWAP-attachment notes;
+//!    [`discover_pswap_rounds`] correlates them with consumed-nullifier
+//!    events and emits one [`PswapLineageRoundUpdate`] per round.
+//! 3. Reclaim → [`Client::build_pswap_cancel_by_order`].
 //!
-//! 1. `build_pswap_create` submission → [`PswapLineageRecord`] row + asset-pair
-//!    tag subscription so sync delivers future remainders.
-//! 2. `Client::sync_state` → [`PswapChainObserver`] collects PSWAP-attachment
-//!    notes; [`discover_pswap_rounds`] joins them with consumed-nullifier
-//!    events from the same sync and emits one [`PswapLineageRoundUpdate`] per
-//!    advanced round, each applied atomically by the store.
-//! 3. Reclaim → [`Client::build_pswap_cancel_by_order`] reconstructs the
-//!    current tip via `PswapNote::remainder_note` and delegates to
-//!    `build_pswap_cancel`.
-//!
-//! Submodules: [`lineage`] (types), [`observer`] (per-note collector),
-//! [`discovery`] (post-sync correlator), [`errors`].
-//!
-//! Protocol-side invariants (≤1 payback + ≤1 remainder per round, attachment
+//! Protocol invariants (≤1 payback + ≤1 remainder per round, attachment
 //! word layout, deterministic reconstruction) live on
 //! `miden_standards::note::PswapNote`.
 
@@ -44,17 +35,11 @@ use crate::transaction::TransactionResult;
 use crate::{Client, transaction::notes_from_output};
 
 impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
-    /// For each PSWAP this wallet just submitted (any output where
-    /// `PswapNote::try_from(note)` succeeds AND `parent_depth == 0`),
-    /// inserts a [`PswapLineageRecord`] and subscribes the asset-pair
-    /// tag so sync delivers future remainders. Idempotent (upsert on
-    /// `order_id` + `(tag, source)` insert).
-    ///
-    /// Tracks regardless of the PSWAP's `creator_account_id` — service-
-    /// style wallets that submit PSWAPs for remote clients get chain
-    /// visibility. Reclaim ([`Self::build_pswap_cancel_by_order`])
-    /// surfaces `CreatorNotLocal` when reclaim isn't possible from this
-    /// wallet.
+    /// Inserts a lineage row + asset-pair tag subscription for every PSWAP
+    /// this transaction just created (any output where `PswapNote::try_from`
+    /// succeeds AND `parent_depth == 0`). Idempotent. Tracks regardless of
+    /// `creator_account_id` (reclaim surfaces `CreatorNotLocal` later if
+    /// the creator isn't a local account).
     pub(crate) async fn record_created_pswap_lineages(
         &self,
         tx_result: &TransactionResult,
@@ -63,37 +48,21 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
         let output_notes = tx_result.executed_transaction().output_notes();
 
         for note in notes_from_output(output_notes) {
-            // Cheap PSWAP-shape filter — fails fast for non-PSWAP
-            // outputs (the dominant case for any transaction).
             let Ok(pswap) = PswapNote::try_from(note) else {
                 continue;
             };
 
-            // Skip remainders we emitted while filling someone else's
-            // PSWAP. Those belong to the OTHER chain (the one being
-            // filled), which is tracked by THAT chain's creator's
-            // wallet — not us.
+            // Skip remainders we emitted while filling someone else's PSWAP —
+            // those belong to that chain's creator, not us.
             if pswap.parent_depth() != 0 {
                 continue;
             }
-
-            // Private PSWAPs are tracked the same way as public ones.
-            // The `NoteAttachment` is the protocol's *explicit* public
-            // sidecar for private notes (see
-            // `miden_protocol::note::NoteAttachment` doc, "An
-            // attachment is a _public_ extension to a note"), and the
-            // adapter commit `d2cddf8f` threads the deserialised
-            // `NoteAttachments` through `CommittedNote` so the
-            // observer reads `attachment_word[0]` regardless of
-            // note_type. No special-case warning is needed.
 
             let record = build_initial_lineage_record(note, &pswap, submission_height);
             let asset_pair_tag = record.asset_pair_tag();
             let original_note_id = record.current_tip_note_id;
 
             self.store.upsert_pswap_lineage(&record).await?;
-            // Subscription keyed by the original PSWAP's NoteId — generic
-            // enough for any future observer with a subscription lifecycle.
             self.store
                 .add_note_tag(NoteTagRecord {
                     tag: asset_pair_tag,
@@ -111,8 +80,7 @@ fn build_initial_lineage_record(
     pswap: &PswapNote,
     submission_height: BlockNumber,
 ) -> PswapLineageRecord {
-    // At creation, remaining_* == initial offered/requested. Both are already
-    // FungibleAssets on the PswapNote.
+    // At depth 0, remaining_* == initial offered/requested.
     PswapLineageRecord {
         original_pswap: pswap.clone(),
         current_tip_note_id: note.id(),
@@ -166,23 +134,13 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
         self.store.get_pswap_lineage(order_id).await.map_err(Into::into)
     }
 
-    /// Builds a transaction request that reclaims the unfilled offered
-    /// asset on the *current tip* of an Active lineage. Works whether
-    /// the tip is the original PSWAP (`current_depth == 0`) or a
-    /// remainder this client never originated (`current_depth > 0`) —
-    /// in the latter case the tip is reconstructed byte-identically
-    /// via `PswapNote::remainder_note`.
+    /// Builds a tx that reclaims the unfilled offered asset on the current
+    /// tip of an Active lineage.
     ///
-    /// Errors:
-    /// - [`PswapLineageError::NotFound`] if no lineage exists for `order_id`.
-    /// - [`PswapLineageError::NotActive`] if the lineage already terminated
-    ///   (`FullyFilled` or `Reclaimed`).
-    /// - [`PswapLineageError::Reconstruction`] if the protocol's
-    ///   `remainder_note` helper rejects the stored inputs (indicates
-    ///   row corruption or protocol/client version skew).
-    /// - [`PswapLineageError::TipMissing`] if `current_depth == 0` but
-    ///   the original output note is not in the local `output_notes`
-    ///   table — implies a sync regression.
+    /// Errors: [`PswapLineageError::NotFound`], [`NotActive`],
+    /// [`CreatorNotLocal`] (reclaim needs creator's signing authority),
+    /// or [`TipMissing`] (tip note isn't in `output_notes`/`input_notes`
+    /// — sync regression).
     pub async fn build_pswap_cancel_by_order(
         &self,
         order_id: Felt,
@@ -197,13 +155,8 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             return Err(PswapLineageError::NotActive(lineage.state).into());
         }
 
-        // Reclaim requires the creator's signing authority. We may be
-        // tracking lineages whose creator is NOT a local account (e.g.
-        // service-style wallets that submitted a PSWAP on behalf of a
-        // remote client — see `record_created_pswap_lineages`); reclaim
-        // is unavailable for those. Failing here is loud and
-        // actionable; deferring the check would manifest as an opaque
-        // signing failure inside transaction execution.
+        // Reclaim requires the creator's signing authority. Fail loud here
+        // rather than deferring to an opaque signing failure.
         let creator = lineage.creator_account_id();
         let local_accounts: BTreeSet<_> =
             self.store.get_account_ids().await?.into_iter().collect();
@@ -211,11 +164,8 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             return Err(PswapLineageError::CreatorNotLocal(creator).into());
         }
 
-        // Look up the current tip note. At depth 0 it's in `output_notes`
-        // (we minted it). At depth > 0 it's in `input_notes` — inserted by
-        // `apply_pswap_round` when the round landed (see layer-2 commit
-        // `d6995a76`). Either way, no reconstruction needed: the note
-        // we wrote IS the note we read.
+        // Depth 0 tip lives in `output_notes` (we minted it); depth > 0 in
+        // `input_notes` (inserted by `apply_pswap_round`).
         let tip_note: Note = if lineage.current_depth == 0 {
             let record = self
                 .store
@@ -240,5 +190,4 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             .build_pswap_cancel(tip_note, lineage.creator_account_id())
             .map_err(ClientError::TransactionRequestError)
     }
-
 }

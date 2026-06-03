@@ -45,12 +45,9 @@ pub async fn discover_pswap_rounds(
     state_sync_update: &StateSyncUpdate,
     chain_note_updates: &[PswapChainNoteUpdate],
 ) -> Result<Vec<PswapLineageRoundUpdate>, ClientError> {
-    // Derive (nullifier, block) pairs for this sync's tracked-note consumptions
-    // from `note_updates` — true positives only, no prefix-collision noise.
     let nullifier_to_block: BTreeMap<Nullifier, BlockNumber> =
         state_sync_update.note_updates.consumed_nullifier_blocks().collect();
 
-    // Most syncs have no PSWAP activity — skip the store query.
     if nullifier_to_block.is_empty() && chain_note_updates.is_empty() {
         return Ok(Vec::new());
     }

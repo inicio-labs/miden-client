@@ -131,7 +131,7 @@ impl SqliteStore {
     /// This function is a helper method which simplifies the process of making queries to the
     /// database. It acquires a connection from the pool and executes the provided function,
     /// returning the result.
-    async fn interact_with_connection<F, R>(&self, f: F) -> Result<R, StoreError>
+    pub(crate) async fn interact_with_connection<F, R>(&self, f: F) -> Result<R, StoreError>
     where
         F: FnOnce(&mut Connection) -> Result<R, StoreError> + Send + 'static,
         R: Send + 'static,
@@ -569,54 +569,35 @@ impl Store for SqliteStore {
 
     // PSWAP LINEAGES
     // --------------------------------------------------------------------------------------------
+    //
+    // Bodies live in `pswap::store_impl` to keep PSWAP code out of lib.rs.
 
     async fn upsert_pswap_lineage(
         &self,
         record: &miden_client::pswap::PswapLineageRecord,
     ) -> Result<(), StoreError> {
-        let record = record.clone();
-        self.interact_with_connection(move |conn| SqliteStore::upsert_pswap_lineage(conn, record))
-            .await
+        crate::pswap::store_impl::upsert_pswap_lineage(self, record).await
     }
 
     async fn get_pswap_lineage(
         &self,
         order_id: Felt,
     ) -> Result<Option<miden_client::pswap::PswapLineageRecord>, StoreError> {
-        self.interact_with_connection(move |conn| SqliteStore::get_pswap_lineage(conn, order_id))
-            .await
+        crate::pswap::store_impl::get_pswap_lineage(self, order_id).await
     }
 
     async fn list_pswap_lineages(
         &self,
         filter: miden_client::pswap::PswapLineageFilter,
     ) -> Result<Vec<miden_client::pswap::PswapLineageRecord>, StoreError> {
-        let by_creator = match &filter {
-            miden_client::pswap::PswapLineageFilter::ByCreator(id) => Some(*id),
-            _ => None,
-        };
-        let rows = self
-            .interact_with_connection(move |conn| SqliteStore::list_pswap_lineages(conn, filter))
-            .await?;
-
-        // The ByCreator filter cannot be expressed in SQL because the creator
-        // is embedded in the serialised `original_pswap` blob; apply it here.
-        Ok(match by_creator {
-            None => rows,
-            Some(account_id) => rows
-                .into_iter()
-                .filter(|r| r.creator_account_id() == account_id)
-                .collect(),
-        })
+        crate::pswap::store_impl::list_pswap_lineages(self, filter).await
     }
 
     async fn apply_pswap_round(
         &self,
         update: &miden_client::pswap::PswapLineageRoundUpdate,
     ) -> Result<(), StoreError> {
-        let update = update.clone();
-        self.interact_with_connection(move |conn| SqliteStore::apply_pswap_round(conn, update))
-            .await
+        crate::pswap::store_impl::apply_pswap_round(self, update).await
     }
 }
 

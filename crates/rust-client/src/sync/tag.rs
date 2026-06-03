@@ -78,12 +78,8 @@ pub enum NoteTagSource {
     Note(NoteDetailsCommitment),
     /// Tag manually added by the user.
     User,
-    /// Tag added by a feature subsystem for the duration of a subscription
-    /// lifecycle (inserted on subscribe, removed on unsubscribe). The
-    /// [`NoteId`] is the subscription's anchor note (the original PSWAP for
-    /// PSWAP chain tracking; analogous note for future observers) — keyed
-    /// by NoteId so any observer can reuse the variant without inventing a
-    /// scheme-specific identifier.
+    /// Subscription tag scoped to an anchor [`NoteId`] (e.g. the original
+    /// PSWAP). Inserted on subscribe, removed on unsubscribe.
     Subscription(NoteId),
 }
 

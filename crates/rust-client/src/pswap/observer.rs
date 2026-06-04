@@ -7,15 +7,15 @@ use alloc::vec::Vec;
 
 use async_trait::async_trait;
 use miden_protocol::account::AccountId;
+use miden_protocol::asset::AssetAmount;
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::{NoteAttachmentHeader, NoteId, NoteInclusionProof, NoteTag};
+use miden_protocol::note::{NoteAttachments, NoteId, NoteInclusionProof, NoteTag};
 use miden_standards::note::{PswapNote, PswapNoteAttachment};
 use tracing::warn;
 
 use crate::ClientError;
 use crate::pswap::discovery::discover_pswap_rounds;
-use crate::rpc::NodeRpcClient;
-use crate::rpc::domain::note::{CommittedNote, FetchedNote};
+use crate::rpc::domain::note::CommittedNote;
 use crate::store::Store;
 use crate::sync::NoteObserver;
 use crate::utils::RwLock;
@@ -37,45 +37,27 @@ pub struct PswapChainNoteUpdate {
     pub inclusion_proof: NoteInclusionProof,
 }
 
-// PENDING PSWAP NOTE
-// ================================================================================================
-
-/// Per-sync queue entry. Attachment word is fetched in `apply()` via
-/// `GetNotesById` (TEMP — see upstream PR #2214).
-#[derive(Debug)]
-struct PendingPswapNote {
-    note_id: NoteId,
-    sender: AccountId,
-    tag: NoteTag,
-    block_num: BlockNumber,
-    inclusion_proof: NoteInclusionProof,
-}
-
 // PSWAP CHAIN OBSERVER
 // ================================================================================================
 
 /// Per-sync collector of PSWAP-attachment notes seen this sync.
 ///
-/// - `observe()` runs per-note during sync: cheap PSWAP-scheme filter, queues a pending record (no
-///   store query, no RPC, no DB write).
-/// - `apply()` runs once post-sync: batches one `GetNotesById`, builds [`PswapChainNoteUpdate`]s,
-///   runs the correlator, applies round updates.
+/// - `observe()` runs per-note during sync: reads the PSWAP attachment word straight off the
+///   note's resolved attachments (carried inline on the sync window) and records a
+///   [`PswapChainNoteUpdate`]. No RPC round trip, no DB write.
+/// - `apply()` runs once post-sync: drains the collector, runs the correlator, applies round
+///   updates.
 pub struct PswapChainObserver {
     store: Arc<dyn Store>,
-    /// **TEMP**: drop once upstream PR #2214 ships attachments alongside
-    /// `StateSyncUpdate` — observer can then read them inline from
-    /// `observe()`'s `CommittedNote` without a per-sync RPC round trip.
-    rpc: Arc<dyn NodeRpcClient>,
     /// `observe()` writes, `apply()` drains; never concurrent.
-    pending_pswap_notes: Arc<RwLock<Vec<PendingPswapNote>>>,
+    chain_note_updates: Arc<RwLock<Vec<PswapChainNoteUpdate>>>,
 }
 
 impl PswapChainObserver {
-    pub fn new(store: Arc<dyn Store>, rpc: Arc<dyn NodeRpcClient>) -> Self {
+    pub fn new(store: Arc<dyn Store>) -> Self {
         Self {
             store,
-            rpc,
-            pending_pswap_notes: Arc::new(RwLock::new(Vec::new())),
+            chain_note_updates: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -86,22 +68,24 @@ impl NoteObserver for PswapChainObserver {
         "PswapChainObserver"
     }
 
-    async fn observe(&self, committed_note: &CommittedNote) -> Result<(), ClientError> {
-        // PSWAP notes carry exactly one attachment (the PSWAP one), so
-        // the first header is the only candidate.
-        let is_pswap = committed_note
-            .metadata()
-            .attachment_headers()
-            .first()
-            .and_then(NoteAttachmentHeader::scheme)
-            == Some(PswapNote::PSWAP_ATTACHMENT_SCHEME);
-        if !is_pswap {
+    async fn observe(
+        &self,
+        committed_note: &CommittedNote,
+        attachments: Option<&NoteAttachments>,
+    ) -> Result<(), ClientError> {
+        // Notes without a PSWAP attachment are the common case; `extract_pswap_attachment`
+        // fast-rejects them. Foreign-order filtering happens later in `discovery`.
+        let Some(attachments) = attachments else {
             return Ok(());
-        }
+        };
+        let Some(attachment) = extract_pswap_attachment(attachments) else {
+            return Ok(());
+        };
 
         let inclusion_proof = committed_note.inclusion_proof().clone();
-        self.pending_pswap_notes.write().push(PendingPswapNote {
+        self.chain_note_updates.write().push(PswapChainNoteUpdate {
             note_id: *committed_note.note_id(),
+            attachment,
             sender: committed_note.sender(),
             tag: committed_note.metadata().tag(),
             block_num: inclusion_proof.location().block_num(),
@@ -110,21 +94,17 @@ impl NoteObserver for PswapChainObserver {
         Ok(())
     }
 
-    /// Batches `GetNotesById`, runs the correlator, applies round
-    /// updates. Per-round failures are logged, not propagated.
+    /// Drains the collector, runs the correlator, applies round updates.
+    /// Per-round failures are logged, not propagated.
     async fn apply(&self, sync_update: &crate::sync::StateSyncUpdate) -> Result<(), ClientError> {
-        let pending = core::mem::take(&mut *self.pending_pswap_notes.write());
+        let chain_note_updates = core::mem::take(&mut *self.chain_note_updates.write());
 
         // Nothing observed AND nothing consumed — correlator has no work.
-        if pending.is_empty() && sync_update.note_updates.consumed_note_ids().next().is_none() {
+        if chain_note_updates.is_empty()
+            && sync_update.note_updates.consumed_note_ids().next().is_none()
+        {
             return Ok(());
         }
-
-        let chain_note_updates = if pending.is_empty() {
-            Vec::new()
-        } else {
-            self.build_chain_note_updates(pending).await?
-        };
 
         let round_updates =
             discover_pswap_rounds(self.store.clone(), sync_update, &chain_note_updates).await?;
@@ -143,52 +123,14 @@ impl NoteObserver for PswapChainObserver {
     }
 }
 
-impl PswapChainObserver {
-    /// Batched `GetNotesById` → extract attachment fields. Foreign-order
-    /// filtering happens later in `discovery`.
-    async fn build_chain_note_updates(
-        &self,
-        pending: Vec<PendingPswapNote>,
-    ) -> Result<Vec<PswapChainNoteUpdate>, ClientError> {
-        let note_ids: Vec<NoteId> = pending.iter().map(|p| p.note_id).collect();
-        let fetched = self.rpc.get_notes_by_id(&note_ids).await?;
-
-        let mut updates = Vec::with_capacity(fetched.len());
-        for fetched_note in fetched {
-            let Some(pending_rec) = pending.iter().find(|p| p.note_id == fetched_note.id()) else {
-                continue;
-            };
-            let Some(attachment) = extract_pswap_attachment(&fetched_note) else {
-                continue;
-            };
-            updates.push(PswapChainNoteUpdate {
-                note_id: pending_rec.note_id,
-                attachment,
-                sender: pending_rec.sender,
-                tag: pending_rec.tag,
-                block_num: pending_rec.block_num,
-                inclusion_proof: pending_rec.inclusion_proof.clone(),
-            });
-        }
-        Ok(updates)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
 
-/// Pulls the typed [`PswapNoteAttachment`] off a fetched note's attachment
-/// word `[amount, order_id, depth, 0]`. **TEMP** — replaced once PR #2214
-/// ships attachments inline on `StateSyncUpdate`.
-fn extract_pswap_attachment(fetched_note: &FetchedNote) -> Option<PswapNoteAttachment> {
-    use miden_protocol::asset::AssetAmount;
-
-    let attachments = match fetched_note {
-        FetchedNote::Private(_, _, _, attachments) => attachments,
-        FetchedNote::Public(note, _) => note.attachments(),
-    };
-
+/// Pulls the typed [`PswapNoteAttachment`] off a note's attachment word
+/// `[amount, order_id, depth, 0]`. Returns `None` for notes without a
+/// PSWAP-scheme attachment or with malformed content.
+fn extract_pswap_attachment(attachments: &NoteAttachments) -> Option<PswapNoteAttachment> {
     let pswap_attach = attachments.find(PswapNote::PSWAP_ATTACHMENT_SCHEME)?;
     let word = pswap_attach.content().as_words().first()?;
 
@@ -196,4 +138,78 @@ fn extract_pswap_attachment(fetched_note: &FetchedNote) -> Option<PswapNoteAttac
     let order_id = word[1];
     let depth = u32::try_from(word[2].as_canonical_u64()).ok()?;
     Some(PswapNoteAttachment::new(amount, order_id, depth))
+}
+
+// ---------------------------------------------------------------------------
+// TESTS
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Reject-branch coverage for `extract_pswap_attachment` — the per-note
+    //! fast-path that turns a raw attachment word into a typed
+    //! [`PswapNoteAttachment`] (or rejects it).
+    use alloc::vec::Vec;
+
+    use miden_protocol::note::{NoteAttachment, NoteAttachmentScheme, NoteAttachments};
+    use miden_protocol::{Felt, Word};
+    use miden_standards::note::PswapNote;
+
+    use super::*;
+
+    /// A PSWAP attachment word `[amount, order_id, depth, 0]`.
+    fn pswap_word(amount: u64, order_id: u64, depth: u64) -> Word {
+        Word::from([
+            Felt::new(amount).unwrap(),
+            Felt::new(order_id).unwrap(),
+            Felt::new(depth).unwrap(),
+            Felt::new(0).unwrap(),
+        ])
+    }
+
+    /// Wraps `word` in a single PSWAP-scheme attachment.
+    fn pswap_attachments(word: Word) -> NoteAttachments {
+        NoteAttachments::from(NoteAttachment::with_word(PswapNote::PSWAP_ATTACHMENT_SCHEME, word))
+    }
+
+    /// Well-formed word round-trips into the typed attachment.
+    #[test]
+    fn extract_pswap_attachment_reads_wellformed_word() {
+        let parsed = extract_pswap_attachment(&pswap_attachments(pswap_word(25, 0xABCD, 3)))
+            .expect("valid PSWAP word must parse");
+        assert_eq!(u64::from(parsed.amount()), 25);
+        assert_eq!(parsed.order_id().as_canonical_u64(), 0xABCD);
+        assert_eq!(parsed.depth(), 3);
+    }
+
+    /// No PSWAP-scheme attachment present → `None`. Covers both the empty
+    /// set and the "has attachments, but none is ours" case (the common
+    /// path for unrelated notes during sync).
+    #[test]
+    fn extract_pswap_attachment_rejects_missing_scheme() {
+        let empty = NoteAttachments::new(Vec::new()).unwrap();
+        assert!(extract_pswap_attachment(&empty).is_none());
+
+        // Scheme 1 ≠ the PSWAP scheme (3).
+        let other = NoteAttachments::from(NoteAttachment::with_word(
+            NoteAttachmentScheme::new(1).unwrap(),
+            pswap_word(1, 2, 3),
+        ));
+        assert!(extract_pswap_attachment(&other).is_none());
+    }
+
+    /// `amount` above `AssetAmount::MAX` is rejected, not panicked on.
+    #[test]
+    fn extract_pswap_attachment_rejects_oversized_amount() {
+        let word = pswap_word(AssetAmount::MAX.as_u64() + 1, 7, 1);
+        assert!(extract_pswap_attachment(&pswap_attachments(word)).is_none());
+    }
+
+    /// `depth` above `u32::MAX` is rejected, not panicked on. The amount
+    /// field is valid so the parser reaches the depth check.
+    #[test]
+    fn extract_pswap_attachment_rejects_oversized_depth() {
+        let word = pswap_word(10, 7, u64::from(u32::MAX) + 1);
+        assert!(extract_pswap_attachment(&pswap_attachments(word)).is_none());
+    }
 }

@@ -883,8 +883,16 @@ impl StateSync {
             // and a failing screener must not rob them of the note. Clone
             // is skipped when no observers are attached (the common case).
             if !self.note_observers.is_empty() {
+                // Resolve attachment content for the note from the sync window: public note
+                // bodies carry their attachments on the cached `InputNoteRecord`; private-note
+                // attachments arrive in their own side-table. Both are keyed by note ID.
+                let note_attachments = if committed_note.note_type() == NoteType::Private {
+                    private_attachments.get(committed_note.note_id())
+                } else {
+                    public_note.as_ref().map(InputNoteRecord::attachments)
+                };
                 for obs in &self.note_observers {
-                    if let Err(err) = obs.observe(&committed_note).await {
+                    if let Err(err) = obs.observe(&committed_note, note_attachments).await {
                         tracing::warn!(
                             observer = obs.name(),
                             error = ?err,

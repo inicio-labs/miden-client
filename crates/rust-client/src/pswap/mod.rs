@@ -22,6 +22,7 @@ mod types;
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use async_trait::async_trait;
 pub use errors::PswapLineageError;
@@ -31,15 +32,23 @@ pub use lineage::{
     PswapLineageRoundUpdate,
     PswapLineageState,
 };
+use miden_protocol::Felt;
+use miden_protocol::account::AccountId;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::Note;
 use miden_standards::note::PswapNote;
 use miden_tx::auth::TransactionAuthenticator;
 pub use observer::{PswapChainNoteUpdate, PswapChainObserver};
 
-use crate::store::Store;
+use crate::store::{NoteFilter, Store};
 use crate::sync::{NoteTagRecord, NoteTagSource};
-use crate::transaction::{TransactionObserver, TransactionResult, notes_from_output};
+use crate::transaction::{
+    TransactionObserver,
+    TransactionRequest,
+    TransactionRequestBuilder,
+    TransactionResult,
+    notes_from_output,
+};
 use crate::{Client, ClientError};
 
 // PSWAP TRANSACTION OBSERVER
@@ -110,14 +119,6 @@ impl TransactionObserver for PswapTransactionObserver {
 // PUBLIC API
 // =============================================================================
 
-use alloc::vec::Vec;
-
-use miden_protocol::Felt;
-use miden_protocol::account::AccountId;
-
-use crate::store::NoteFilter;
-use crate::transaction::{TransactionRequest, TransactionRequestBuilder};
-
 impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
     /// Returns every PSWAP lineage tracked by this client.
     pub async fn pswap_lineages(&self) -> Result<Vec<PswapLineageRecord>, ClientError> {
@@ -169,16 +170,11 @@ impl<AUTH: TransactionAuthenticator + Sync + 'static> Client<AUTH> {
             return Err(PswapLineageError::CreatorNotLocal(creator).into());
         }
 
-        // Depth 0 tip → output_notes (we minted it); depth > 0 → input_notes.
+        // At depth 0 the tip is the original PSWAP, already held on the
+        // lineage record — no store lookup needed. At depth > 0 the tip is a
+        // remainder discovered during sync and persisted to `input_notes`.
         let tip_note: Note = if lineage.current_depth == 0 {
-            let record = self
-                .store
-                .get_output_notes(NoteFilter::Unique(lineage.current_tip_note_id))
-                .await?
-                .into_iter()
-                .next()
-                .ok_or(PswapLineageError::TipMissing)?;
-            record.try_into().map_err(ClientError::NoteRecordConversionError)?
+            Note::from(lineage.original_pswap.clone())
         } else {
             let record = self
                 .store

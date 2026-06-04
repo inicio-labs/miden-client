@@ -704,25 +704,18 @@ pub trait Store: Send + Sync {
         filter: crate::pswap::PswapLineageFilter,
     ) -> Result<Vec<crate::pswap::PswapLineageRecord>, StoreError>;
 
-    /// Atomically advances a lineage by one round. Inside a single SQL
+    /// Atomically applies one round of a PSWAP lineage. In a single SQL
     /// transaction the implementation MUST:
+    /// 1. Reject `update.round_depth != current_depth + 1` (fail-loud against
+    ///    correlator off-by-ones and duplicate deliveries).
+    /// 2. Update the row's tip, depth, `remaining_*`, `last_consumer` /
+    ///    `last_payout`, `state`, and `updated_at_block`.
+    /// 3. If `update.payback.is_some()`, `INSERT OR IGNORE` it into
+    ///    `input_notes` (public paybacks are pre-inserted by `NoteScreener`;
+    ///    private ones land here only).
     ///
-    /// 1. Validate that `update.round_depth == current_depth + 1` against the row that exists for
-    ///    `update.order_id`. The store is the last line of defense against correlator off-by-ones
-    ///    and duplicate deliveries; silently writing a wrong depth corrupts the reconstruction
-    ///    chain. Missing row OR depth mismatch is a fail-loud condition.
-    /// 2. Update the matching `pswap_lineages` row — tip, depth, `remaining_*`, `last_consumer` /
-    ///    `last_payout`, `state`, `updated_at_block`.
-    /// 3. If `update.payback.is_some()`, insert that note into `input_notes` with `INSERT OR
-    ///    IGNORE` semantics on the `note_id` PK. For a *public* payback the default `NoteScreener`
-    ///    will already have inserted the row in `Committed` state with a valid inclusion proof;
-    ///    overwriting it would downgrade the state. For a *private* payback this is the only
-    ///    insertion site (the screener discards private notes it does not own).
-    ///
-    /// Returning before all steps commit leaves the lineage in an
-    /// observable half-applied state, so backends without genuine
-    /// transactions (e.g. an early WASM stub) MUST surface a clear error
-    /// rather than silently splitting the write.
+    /// Backends without real transactions (e.g. a WASM stub) MUST error
+    /// rather than commit a half-applied state.
     async fn apply_pswap_round(
         &self,
         update: &crate::pswap::PswapLineageRoundUpdate,

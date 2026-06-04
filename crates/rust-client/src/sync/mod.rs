@@ -126,10 +126,7 @@ where
         self.ensure_genesis_in_place().await?;
         self.ensure_rpc_limits_in_place().await?;
 
-        // Build sync state components. Each `NoteObserver` owns its own
-        // per-sync collector internally and drives its own post-sync work
-        // via `apply()` — no orchestration plumbing needed here beyond
-        // attach + dispatch.
+        // Each `NoteObserver` owns its own per-sync state; `with_note_observer` just attaches.
         let note_screener = self.note_screener();
         let state_sync =
             StateSync::new(self.rpc_api.clone(), Arc::new(note_screener), self.tx_discard_delta)
@@ -144,10 +141,8 @@ where
         let sync_summary: SyncSummary = (&state_sync_update).into();
         debug!(sync_summary = ?sync_summary, "Sync summary computed");
 
-        // Run each attached observer's post-sync `apply()` hook against
-        // the in-memory sync update, BEFORE persisting it. Per-observer
-        // failures are logged inside the dispatcher; this call doesn't
-        // propagate apply-side errors.
+        // Post-sync observer hooks; run before persisting. Per-observer errors are logged, not
+        // propagated.
         state_sync.run_apply_hooks(&state_sync_update).await?;
 
         info!("Applying changes to the store.");

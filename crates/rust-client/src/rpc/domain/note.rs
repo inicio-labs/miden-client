@@ -333,7 +333,6 @@ impl TryFrom<proto::note::NoteSyncRecord> for CommittedNote {
 // ================================================================================================
 
 /// Describes the possible responses from the `GetNotesById` endpoint for a single note.
-#[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum FetchedNote {
     /// Details for a private note include its ID, metadata, attachments and inclusion proof. Other

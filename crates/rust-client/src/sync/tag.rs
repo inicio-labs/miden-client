@@ -176,7 +176,8 @@ impl TryInto<NoteTagRecord> for &InputNoteRecord {
 #[cfg(test)]
 mod tag_source_tests {
     use miden_protocol::Word;
-    use miden_protocol::note::NoteId;
+    use miden_protocol::account::AccountId;
+    use miden_protocol::note::{NoteDetailsCommitment, NoteId};
     use miden_protocol::testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET;
 
     use super::{Deserializable, NoteTagSource, Serializable};
@@ -209,19 +210,14 @@ mod tag_source_tests {
         }
     }
 
-    /// Round-trip every variant. Backward-compatibility check: even when
-    /// the `Subscription` discriminant (3) is added, the existing
-    /// `Account` / `Note` / `User` variants must continue to round-trip
-    /// unchanged.
+    /// Round-trip every variant. Confirms the new `Subscription` discriminant
+    /// (3) coexists with the existing `Account` / `Note` / `User` variants
+    /// without disturbing their on-disk encoding.
     #[test]
     fn note_tag_source_round_trip_every_variant() {
-        let account_id =
-            miden_protocol::account::AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET)
-                .unwrap();
-        let details_commitment = miden_protocol::note::NoteDetailsCommitment::from_raw_commitments(
-            miden_protocol::Word::empty(),
-            miden_protocol::Word::empty(),
-        );
+        let account_id = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
+        let details_commitment =
+            NoteDetailsCommitment::from_raw_commitments(Word::empty(), Word::empty());
         let subscription_key = note_id_from_u64(0xdead_beef_dead_beef);
 
         let variants = [

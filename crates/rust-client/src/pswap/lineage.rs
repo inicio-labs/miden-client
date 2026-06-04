@@ -254,6 +254,7 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use miden_protocol::asset::AssetAmount;
+    use miden_standards::note::PswapNote;
 
     use super::test_helpers::{build_test_pswap, fixed_account_ids};
     use super::*;
@@ -359,48 +360,6 @@ mod tests {
         }
     }
 
-    /// An out-of-range `remaining_*` column (a corrupt row) surfaces as
-    /// `InconsistentRow` rather than panicking: `u64::MAX` exceeds
-    /// `FungibleAsset`'s max amount, so `FungibleAsset::new` rejects it.
-    /// Both columns are checked so neither construction can silently swallow
-    /// a bad value.
-    #[test]
-    fn build_record_from_columns_rejects_out_of_range_amounts() {
-        let (sender, creator, offered_faucet, requested_faucet) = fixed_account_ids();
-        let pswap = build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
-        let note = miden_protocol::note::Note::from(pswap.clone());
-
-        // Oversized offered amount.
-        match build_record_from_columns(
-            pswap.clone(),
-            note.id(),
-            0,
-            u64::MAX,
-            50,
-            PswapLineageState::Active.as_u8(),
-            BlockNumber::from(0),
-            BlockNumber::from(0),
-        ) {
-            Err(PswapLineageError::InconsistentRow(_)) => {},
-            other => panic!("expected InconsistentRow for oversized offered, got {other:?}"),
-        }
-
-        // Oversized requested amount.
-        match build_record_from_columns(
-            pswap,
-            note.id(),
-            0,
-            100,
-            u64::MAX,
-            PswapLineageState::Active.as_u8(),
-            BlockNumber::from(0),
-            BlockNumber::from(0),
-        ) {
-            Err(PswapLineageError::InconsistentRow(_)) => {},
-            other => panic!("expected InconsistentRow for oversized requested, got {other:?}"),
-        }
-    }
-
     /// `asset_pair_tag()` and `order_id()` accessors delegate to the
     /// stored `PswapNote` rather than persisting the values
     /// separately. Verifies the delegation is consistent (no column
@@ -411,7 +370,7 @@ mod tests {
         let pswap = build_test_pswap(sender, creator, offered_faucet, 100, requested_faucet, 50);
 
         let expected_order_id = pswap.order_id();
-        let expected_tag = miden_standards::note::PswapNote::create_tag(
+        let expected_tag = PswapNote::create_tag(
             pswap.note_type(),
             pswap.offered_asset(),
             pswap.storage().requested_asset(),

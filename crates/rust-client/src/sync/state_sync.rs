@@ -134,14 +134,21 @@ impl NoteUpdateAction {
 
 /// A per-note sync observer. Multiple observers can be attached to [`StateSync`]; each is invoked
 /// for every note inclusion received during sync, and once more post-sync via [`Self::apply`].
+///
+/// `Send + Sync` so observer lists can be held on the (shareable) [`Client`](crate::Client).
 #[async_trait(?Send)]
-pub trait OnNoteReceived {
+pub trait OnNoteReceived: Send + Sync {
     /// Identifier used to tag this observer in `tracing::warn!` events when its post-sync `apply`
     /// fails. Observers with a fallible `apply` should override this; the default suits
     /// screening-only observers whose `apply` never fails and so are never named in a log.
     fn name(&self) -> &'static str {
         "OnNoteReceived"
     }
+
+    /// Pre-sync hook, invoked once before any [`Self::on_note_received`] call for a sync. Lets an
+    /// observer reused across syncs clear per-sync scratch state so a sync aborted before
+    /// [`Self::apply`] cannot leak observations into the next sync. Default is a no-op.
+    fn on_sync_start(&self) {}
 
     /// Callback that gets executed when a new note is received as part of the sync response.
     ///
@@ -179,9 +186,9 @@ pub struct StateSync {
     /// The RPC client used to communicate with the node.
     rpc_api: Arc<dyn NodeRpcClient>,
     /// Note observers invoked for every note inclusion in `note_state_sync` and once post-sync in
-    /// [`Self::run_apply_hooks`]. The first entry is the screener passed to [`Self::new`]; more
-    /// are appended via [`Self::with_note_observer`]. Per-note verdicts are folded by
-    /// precedence.
+    /// [`Self::run_apply_hooks`]. The caller supplies the full list to [`Self::new`] (the note
+    /// screener conventionally first); more can be appended via [`Self::with_note_observer`].
+    /// Per-note verdicts are folded by precedence.
     note_observers: Vec<Arc<dyn OnNoteReceived>>,
     /// Number of blocks after which pending transactions are considered stale and discarded.
     /// If `None`, there is no limit and transactions will be kept indefinitely.
@@ -200,16 +207,16 @@ impl StateSync {
     /// # Arguments
     ///
     /// * `rpc_api` - The RPC client used to communicate with the node.
-    /// * `note_screener` - The note screener used to check the relevance of notes.
+    /// * `note_observers` - The per-note observers, screener first.
     /// * `tx_discard_delta` - Number of blocks after which pending transactions are discarded.
     pub fn new(
         rpc_api: Arc<dyn NodeRpcClient>,
-        note_screener: Arc<dyn OnNoteReceived>,
+        note_observers: Vec<Arc<dyn OnNoteReceived>>,
         tx_discard_delta: Option<u32>,
     ) -> Self {
         Self {
             rpc_api,
-            note_observers: alloc::vec![note_screener],
+            note_observers,
             tx_discard_delta,
             sync_nullifiers: true,
         }
@@ -217,7 +224,8 @@ impl StateSync {
 
     /// Appends a note observer. Handlers run in attachment order; their per-note verdicts are
     /// folded by precedence, and their post-sync `apply` failures are logged (tagged with
-    /// [`OnNoteReceived::name`]) and never abort sync.
+    /// [`OnNoteReceived::name`]) and never abort sync. Deduplication is the caller's concern (the
+    /// builder deduplicates user-registered observers).
     #[must_use]
     pub fn with_note_observer(mut self, observer: Arc<dyn OnNoteReceived>) -> Self {
         self.note_observers.push(observer);
@@ -280,6 +288,12 @@ impl StateSync {
         current_partial_mmr: &mut PartialMmr,
         input: StateSyncInput,
     ) -> Result<StateSyncUpdate, ClientError> {
+        // Let observers reused across syncs clear per-sync scratch state before any note is
+        // processed, so a sync aborted before `run_apply_hooks` cannot leak into the next one.
+        for observer in &self.note_observers {
+            observer.on_sync_start();
+        }
+
         let StateSyncInput {
             accounts,
             note_tags,
@@ -1308,6 +1322,7 @@ fn compute_ordered_nullifiers(transaction_records: &[RpcTransactionRecord]) -> V
 mod tests {
     use alloc::collections::BTreeSet;
     use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use miden_protocol::account::Account;
@@ -1392,11 +1407,66 @@ mod tests {
         let mut builder = MockChainBuilder::new();
         let _account = builder.add_existing_mock_account(miden_testing::Auth::IncrNonce).unwrap();
         let rpc_api = MockRpcApi::new(builder.build().unwrap());
-        let state_sync = StateSync::new(Arc::new(rpc_api), Arc::new(ErroringApply), None);
+        let state_sync =
+            StateSync::new(Arc::new(rpc_api), alloc::vec![Arc::new(ErroringApply)], None);
 
         let result = state_sync.run_apply_hooks(&StateSyncUpdate::default()).await;
 
         assert!(result.is_ok(), "run_apply_hooks must swallow an observer's apply() error");
+    }
+
+    /// Counts `on_sync_start` invocations. Observers reused across syncs rely on this hook to reset
+    /// per-sync scratch state (e.g. `PswapChainObserver`'s collector).
+    struct SyncStartCounter {
+        starts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait(?Send)]
+    impl OnNoteReceived for SyncStartCounter {
+        fn on_sync_start(&self) {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn on_note_received(
+            &self,
+            _committed_note: &CommittedNote,
+            _public_note: Option<&InputNoteRecord>,
+            _attachments: Option<&NoteAttachments>,
+        ) -> Result<NoteUpdateAction, ClientError> {
+            Ok(NoteUpdateAction::Discard)
+        }
+    }
+
+    /// `sync_state` invokes `on_sync_start` on every observer exactly once per sync, so an observer
+    /// reused across syncs can clear per-sync state and cannot leak observations into the next
+    /// sync.
+    #[tokio::test]
+    async fn sync_state_invokes_on_sync_start_each_sync() {
+        let mock_rpc = MockRpcApi::default();
+        mock_rpc.advance_blocks(3);
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        let state_sync = StateSync::new(
+            Arc::new(mock_rpc.clone()),
+            alloc::vec![
+                Arc::new(SyncStartCounter { starts: starts.clone() }) as Arc<dyn OnNoteReceived>
+            ],
+            None,
+        );
+
+        let genesis_peaks =
+            mock_rpc.get_mmr().peaks_at(Forest::new(1).expect("valid forest")).unwrap();
+        let mut partial_mmr = PartialMmr::from_peaks(genesis_peaks);
+
+        state_sync.sync_state(&mut partial_mmr, empty()).await.unwrap();
+        mock_rpc.advance_blocks(2);
+        state_sync.sync_state(&mut partial_mmr, empty()).await.unwrap();
+
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "on_sync_start must fire once per sync_state call"
+        );
     }
 
     fn empty() -> StateSyncInput {
@@ -1442,7 +1512,8 @@ mod tests {
         let account = builder.add_existing_mock_account(miden_testing::Auth::IncrNonce).unwrap();
         let rpc_api = MockRpcApi::new(builder.build().unwrap());
         let chain_tip_header = rpc_api.mock_chain.read().latest_block_header();
-        let state_sync = StateSync::new(Arc::new(rpc_api), Arc::new(MockScreener), None);
+        let state_sync =
+            StateSync::new(Arc::new(rpc_api), alloc::vec![Arc::new(MockScreener)], None);
 
         // Local state is at a higher nonce than the node's snapshot (our own tx isn't committed
         // there yet), so the node snapshot must be ignored.
@@ -1479,7 +1550,8 @@ mod tests {
         let account = builder.add_existing_mock_account(miden_testing::Auth::IncrNonce).unwrap();
         let rpc_api = MockRpcApi::new(builder.build().unwrap());
         let chain_tip_header = rpc_api.mock_chain.read().latest_block_header();
-        let state_sync = StateSync::new(Arc::new(rpc_api), Arc::new(MockScreener), None);
+        let state_sync =
+            StateSync::new(Arc::new(rpc_api), alloc::vec![Arc::new(MockScreener)], None);
 
         // Local state is at the same nonce as the node's but with a different commitment: a fork
         // where the local transaction lost the race and must be discarded.
@@ -1553,7 +1625,8 @@ mod tests {
         let rpc_api = MockRpcApi::new(builder.build().unwrap());
         let chain_tip_header = rpc_api.mock_chain.read().latest_block_header();
         let on_chain_commitment = account.to_commitment();
-        let state_sync = StateSync::new(Arc::new(rpc_api), Arc::new(MockScreener), None);
+        let state_sync =
+            StateSync::new(Arc::new(rpc_api), alloc::vec![Arc::new(MockScreener)], None);
 
         let result = state_sync
             .verify_private_account_mismatch(account.id(), on_chain_commitment, &chain_tip_header)
@@ -1575,7 +1648,8 @@ mod tests {
         let rpc_api = MockRpcApi::new(builder.build().unwrap());
         let chain_tip_header = rpc_api.mock_chain.read().latest_block_header();
         let on_chain_commitment = account.to_commitment();
-        let state_sync = StateSync::new(Arc::new(rpc_api), Arc::new(MockScreener), None);
+        let state_sync =
+            StateSync::new(Arc::new(rpc_api), alloc::vec![Arc::new(MockScreener)], None);
         let stale_local_commitment = word(0xdead_beef);
 
         let result = state_sync
@@ -1602,7 +1676,8 @@ mod tests {
         let account = builder.add_existing_mock_account(miden_testing::Auth::IncrNonce).unwrap();
         let rpc_api = MockRpcApi::new(builder.build().unwrap());
         let real_header = rpc_api.mock_chain.read().latest_block_header();
-        let state_sync = StateSync::new(Arc::new(rpc_api), Arc::new(MockScreener), None);
+        let state_sync =
+            StateSync::new(Arc::new(rpc_api), alloc::vec![Arc::new(MockScreener)], None);
 
         // Same block number so the request resolves, but a tampered account root the witness
         // cannot verify against.
@@ -1979,8 +2054,11 @@ mod tests {
         let (chain, account, [note1, note2, note3]) = build_chain_with_chained_consume_txs().await;
 
         let mock_rpc = MockRpcApi::new(chain);
-        let state_sync =
-            StateSync::new(Arc::new(mock_rpc.clone()), Arc::new(CommitAllScreener), None);
+        let state_sync = StateSync::new(
+            Arc::new(mock_rpc.clone()),
+            alloc::vec![Arc::new(CommitAllScreener)],
+            None,
+        );
 
         let genesis_peaks =
             mock_rpc.get_mmr().peaks_at(Forest::new(1).expect("valid forest")).unwrap();
@@ -2038,7 +2116,8 @@ mod tests {
         mock_rpc.advance_blocks(3);
         let chain_tip_1 = mock_rpc.get_chain_tip_block_num();
 
-        let state_sync = StateSync::new(Arc::new(mock_rpc.clone()), Arc::new(MockScreener), None);
+        let state_sync =
+            StateSync::new(Arc::new(mock_rpc.clone()), alloc::vec![Arc::new(MockScreener)], None);
 
         // Build the initial PartialMmr from genesis (only 1 leaf).
         let genesis_peaks =
@@ -2210,7 +2289,8 @@ mod tests {
 
         // Test that fetch_sync_data returns note blocks with valid MMR paths that
         // can be used to track blocks in the partial MMR.
-        let state_sync = StateSync::new(Arc::new(mock_rpc.clone()), Arc::new(MockScreener), None);
+        let state_sync =
+            StateSync::new(Arc::new(mock_rpc.clone()), alloc::vec![Arc::new(MockScreener)], None);
 
         let genesis_peaks =
             mock_rpc.get_mmr().peaks_at(Forest::new(1).expect("valid forest")).unwrap();
@@ -2422,7 +2502,8 @@ mod tests {
         let network_header =
             AccountHeader::new(network_account_id, ZERO, EMPTY_WORD, EMPTY_WORD, EMPTY_WORD);
 
-        let state_sync = StateSync::new(Arc::new(mock_rpc.clone()), Arc::new(MockScreener), None);
+        let state_sync =
+            StateSync::new(Arc::new(mock_rpc.clone()), alloc::vec![Arc::new(MockScreener)], None);
 
         let genesis_peaks =
             mock_rpc.get_mmr().peaks_at(Forest::new(1).expect("valid forest")).unwrap();

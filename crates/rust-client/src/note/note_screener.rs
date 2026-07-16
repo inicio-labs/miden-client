@@ -189,6 +189,12 @@ impl NoteScreener {
 
 #[async_trait(?Send)]
 impl OnNoteReceived for NoteScreener {
+    /// Distinct name so the built-in screener is never conflated with a user observer left on the
+    /// default `OnNoteReceived::name`, which observer deduplication keys on.
+    fn name(&self) -> &'static str {
+        "NoteScreener"
+    }
+
     /// Default implementation of the [`OnNoteReceived`] callback. It queries the store for the
     /// committed note to check if it's relevant. If the note wasn't being tracked but it came in
     /// the sync response it may be a new public note, in that case we use the [`NoteScreener`]

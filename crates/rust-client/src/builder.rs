@@ -15,12 +15,13 @@ use crate::alloc::string::ToString;
 #[cfg(feature = "std")]
 use crate::keystore::FilesystemKeyStore;
 use crate::keystore::Keystore;
+use crate::note::NoteScreener;
 use crate::note_transport::NoteTransportClient;
-use crate::pswap::PswapTransactionObserver;
 use crate::rpc::{Endpoint, NodeRpcClient};
 use crate::store::{Store, StoreError};
+use crate::sync::OnNoteReceived;
 use crate::transaction::{TransactionObserver, TransactionProver};
-use crate::{Client, ClientError, ClientRng, ClientRngBox, DebugMode, grpc_support};
+use crate::{Client, ClientError, ClientRng, ClientRngBox, DebugMode, grpc_support, push_deduped};
 
 // CONSTANTS
 // ================================================================================================
@@ -144,6 +145,12 @@ pub struct ClientBuilder<AUTH> {
     endpoint: Option<Endpoint>,
     /// An optional shared source manager for MASM source information.
     source_manager: Option<Arc<dyn SourceManagerSync>>,
+    /// Transaction observers to register on the client, fired by `apply_transaction`. None are
+    /// built in; register via [`with_transaction_observer()`](Self::with_transaction_observer).
+    transaction_observers: Vec<Arc<dyn TransactionObserver>>,
+    /// Additional per-note sync observers to register, beyond the built-in note screener. Register
+    /// via [`with_note_observer()`](Self::with_note_observer).
+    note_observers: Vec<Arc<dyn OnNoteReceived>>,
 }
 
 impl<AUTH> Default for ClientBuilder<AUTH> {
@@ -163,6 +170,8 @@ impl<AUTH> Default for ClientBuilder<AUTH> {
             tx_prover: None,
             endpoint: None,
             source_manager: None,
+            transaction_observers: Vec::new(),
+            note_observers: Vec::new(),
         }
     }
 }
@@ -441,6 +450,44 @@ where
         self
     }
 
+    /// Registers a [`TransactionObserver`] fired by `apply_transaction`.
+    ///
+    /// No transaction observers are built in — a plain-built client fires none. Registration is
+    /// deduplicated by [`name`](TransactionObserver::name), so registering the same observer twice
+    /// is a no-op.
+    ///
+    /// Store-backed built-in observers (e.g. PSWAP) need the store handle, so construct the store
+    /// yourself and pass the same `Arc` to both [`store()`](Self::store) and the observer:
+    ///
+    /// ```ignore
+    /// let store = Arc::new(SqliteStore::new(path).await?);
+    /// let client = ClientBuilder::new()
+    ///     .store(store.clone())
+    ///     .with_transaction_observer(Arc::new(PswapTransactionObserver::new(store.clone())))
+    ///     .with_note_observer(Arc::new(PswapChainObserver::new(store)))
+    ///     .authenticator(auth)
+    ///     .build()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_transaction_observer(mut self, observer: Arc<dyn TransactionObserver>) -> Self {
+        push_deduped(&mut self.transaction_observers, observer);
+        self
+    }
+
+    /// Registers an additional [`OnNoteReceived`] observer, seeded into the per-sync observer list
+    /// after the built-in note screener.
+    ///
+    /// Observers are distinguished by [`name`](OnNoteReceived::name): registering one whose name is
+    /// already registered (e.g. the same observer twice) is a no-op, so give distinct observers
+    /// distinct names. See [`with_transaction_observer()`](Self::with_transaction_observer) for the
+    /// store-handle pattern used to register store-backed observers.
+    #[must_use]
+    pub fn with_note_observer(mut self, observer: Arc<dyn OnNoteReceived>) -> Self {
+        push_deduped(&mut self.note_observers, observer);
+        self
+    }
+
     /// Returns the endpoint configured for this builder, if any.
     ///
     /// This is set automatically when using network-specific constructors like
@@ -521,11 +568,16 @@ where
             self.note_transport_api = Some(Arc::new(transport) as Arc<dyn NoteTransportClient>);
         }
 
-        // Built-in transaction observers fired by `apply_transaction`.
-        // Additional observers can be attached via
-        // `Client::with_transaction_observer`.
-        let transaction_observers: Vec<Arc<dyn TransactionObserver>> =
-            vec![Arc::new(PswapTransactionObserver::new(store.clone()))];
+        // Transaction observers fired by `apply_transaction`, as registered on the builder. None
+        // are built in; they are deduplicated by name at registration.
+        let transaction_observers = self.transaction_observers;
+
+        // Per-note sync observers seeded into `StateSync` on every sync. The note screener is
+        // always at index 0; the builder-registered observers (already deduped) follow.
+        let mut note_observers: Vec<Arc<dyn OnNoteReceived>> =
+            vec![Arc::new(NoteScreener::new(store.clone(), rpc_api.clone()))
+                as Arc<dyn OnNoteReceived>];
+        note_observers.extend(self.note_observers);
 
         // Construct and return the Client
         Ok(Client {
@@ -551,6 +603,7 @@ where
             cache_partial_mmr_in_memory: self.cache_partial_mmr_in_memory,
             partial_mmr: None,
             transaction_observers,
+            note_observers,
         })
     }
 }

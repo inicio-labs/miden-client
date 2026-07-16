@@ -19,7 +19,7 @@ use miden_client::auth::{
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::note::{BlockNumber, NetworkAccountTarget, NoteExecutionHint};
-use miden_client::pswap::PswapLineageState;
+use miden_client::pswap::{PswapChainObserver, PswapLineageState, PswapTransactionObserver};
 use miden_client::rpc::NodeRpcClient;
 use miden_client::store::input_note_states::ConsumedAuthenticatedLocalNoteState;
 use miden_client::store::{
@@ -61,7 +61,7 @@ use miden_client::transaction::{
 };
 use miden_client::utils::{Deserializable, Serializable};
 use miden_client::{ClientError, DebugMode};
-use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use miden_client_sqlite_store::{ClientBuilderSqliteExt, SqliteStore};
 use miden_protocol::account::{
     Account,
     AccountBuilder,
@@ -635,7 +635,8 @@ async fn sync_persists_auth_nodes_for_skipped_blocks() {
     partial_mmr.add(genesis.commitment(), true).unwrap(); // track genesis
 
     // Create a StateSync that discards all notes so intermediate blocks are skipped
-    let state_sync = StateSync::new(Arc::new(rpc_api.clone()), Arc::new(DiscardAllNotes), None);
+    let state_sync =
+        StateSync::new(Arc::new(rpc_api.clone()), vec![Arc::new(DiscardAllNotes)], None);
 
     // Use the note tag from the prebuilt chain (tag 0) so the mock RPC returns
     // blocks step-by-step (block 1, then block 4, then the chain tip) instead of
@@ -725,8 +726,9 @@ async fn sync_observe_retains_blocks_a_discarding_screener_would_skip() {
     let mut partial_mmr = PartialMmr::from_peaks(MmrPeaks::new(Forest::empty(), vec![]).unwrap());
     partial_mmr.add(genesis.commitment(), true).unwrap();
 
-    let state_sync = StateSync::new(Arc::new(rpc_api.clone()), Arc::new(DiscardAllNotes), None)
-        .with_note_observer(Arc::new(ObserveAllNotes));
+    let state_sync =
+        StateSync::new(Arc::new(rpc_api.clone()), vec![Arc::new(DiscardAllNotes)], None)
+            .with_note_observer(Arc::new(ObserveAllNotes));
 
     let state_sync_update = state_sync
         .sync_state(
@@ -783,7 +785,8 @@ async fn sync_aborts_when_an_observer_errors() {
     let mut partial_mmr = PartialMmr::from_peaks(MmrPeaks::new(Forest::empty(), vec![]).unwrap());
     partial_mmr.add(genesis.commitment(), true).unwrap();
 
-    let state_sync = StateSync::new(Arc::new(rpc_api.clone()), Arc::new(ErroringScreener), None);
+    let state_sync =
+        StateSync::new(Arc::new(rpc_api.clone()), vec![Arc::new(ErroringScreener)], None);
 
     // Block 1 carries notes (tag 0), so `on_note_received` is invoked and its error propagates.
     let result = state_sync
@@ -852,7 +855,8 @@ async fn sync_state_no_redundant_get_account_calls() {
     let mut partial_mmr = PartialMmr::from_peaks(MmrPeaks::new(Forest::empty(), vec![]).unwrap());
     partial_mmr.add(genesis.commitment(), true).unwrap();
 
-    let state_sync = StateSync::new(Arc::new(rpc_api.clone()), Arc::new(DiscardAllNotes), None);
+    let state_sync =
+        StateSync::new(Arc::new(rpc_api.clone()), vec![Arc::new(DiscardAllNotes)], None);
 
     // Use tag 0 to force multiple sync steps (notes exist in blocks 1 and 4)
     let note_tags = BTreeSet::from([NoteTag::new(0)]);
@@ -3151,19 +3155,65 @@ async fn create_pswap_test_client(
 
     let keystore = FilesystemKeyStore::new(temp_dir()).unwrap();
 
+    // PSWAP tracking is opt-in, so build the store explicitly and hand the same handle to both the
+    // client and the built-in PSWAP observers registered below.
+    let store = Arc::new(SqliteStore::new(create_test_store_path()).await.unwrap());
+
     let mut client = ClientBuilder::new()
         .rpc(Arc::new(mock_rpc_api.clone()))
         .rng(Box::new(rng))
-        .sqlite_store(create_test_store_path())
+        .store(store.clone())
         .authenticator(Arc::new(keystore.clone()))
         .in_debug_mode(DebugMode::Enabled)
         .tx_discard_delta(None)
+        .with_transaction_observer(Arc::new(PswapTransactionObserver::new(store.clone())))
+        .with_note_observer(Arc::new(PswapChainObserver::new(store.clone())))
         .build()
         .await
         .unwrap();
     client.ensure_genesis_in_place().await.unwrap();
 
     (client, keystore)
+}
+
+/// A plainly built client registers only the built-in note screener — no PSWAP observers on either
+/// the note or transaction side.
+#[tokio::test]
+async fn plain_client_registers_only_the_note_screener() {
+    let (client, _rpc_api, _keystore) = create_test_client().await;
+
+    assert_eq!(client.note_observer_names(), vec!["NoteScreener"]);
+    assert!(client.transaction_observer_names().is_empty());
+}
+
+/// Registering the same observer twice on either side is a no-op — it fires once. The screener
+/// stays first in the note-observer list.
+#[tokio::test]
+async fn observer_registration_is_deduplicated_by_name() {
+    let mut seed_rng = rand::rng();
+    let coin_seed: [u64; 4] = seed_rng.random();
+    let rng = RandomCoin::new(coin_seed.map(|v| Felt::new_unchecked(v >> 1)).into());
+    let keystore = FilesystemKeyStore::new(temp_dir()).unwrap();
+    let rpc_api = MockRpcApi::new(Box::pin(create_prebuilt_mock_chain()).await);
+    let store = Arc::new(SqliteStore::new(create_test_store_path()).await.unwrap());
+
+    let client = ClientBuilder::new()
+        .rpc(Arc::new(rpc_api))
+        .rng(Box::new(rng))
+        .store(store.clone())
+        .authenticator(Arc::new(keystore))
+        .in_debug_mode(DebugMode::Enabled)
+        .tx_discard_delta(None)
+        .with_note_observer(Arc::new(PswapChainObserver::new(store.clone())))
+        .with_note_observer(Arc::new(PswapChainObserver::new(store.clone())))
+        .with_transaction_observer(Arc::new(PswapTransactionObserver::new(store.clone())))
+        .with_transaction_observer(Arc::new(PswapTransactionObserver::new(store.clone())))
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(client.note_observer_names(), vec!["NoteScreener", "PswapChainObserver"]);
+    assert_eq!(client.transaction_observer_names(), vec!["PswapTransactionObserver"]);
 }
 
 /// Two-client mock-chain test: Alice creates a PSWAP, Bob partial-fills, Alice reclaims the

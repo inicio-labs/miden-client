@@ -57,7 +57,6 @@
 //! processed and applied to the local store.
 
 use alloc::collections::BTreeSet;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::max;
 
@@ -69,7 +68,6 @@ use miden_tx::auth::TransactionAuthenticator;
 use miden_tx::utils::serde::{Deserializable, DeserializationError, Serializable};
 use tracing::{debug, info};
 
-use crate::pswap::PswapChainObserver;
 use crate::store::{NoteFilter, TransactionFilter};
 use crate::{Client, ClientError};
 mod block_header;
@@ -117,11 +115,13 @@ where
         self.ensure_genesis_in_place().await?;
         self.ensure_rpc_limits_in_place().await?;
 
-        // Each observer owns its own per-sync state; `with_note_observer` just attaches.
-        let note_screener = self.note_screener();
-        let state_sync =
-            StateSync::new(self.rpc_api.clone(), Arc::new(note_screener), self.tx_discard_delta)
-                .with_note_observer(Arc::new(PswapChainObserver::new(self.store.clone())));
+        // Seed the sync with the client's registered note observers (screener first). Observer
+        // instances are shared across syncs; each owns its own interior per-sync state.
+        let state_sync = StateSync::new(
+            self.rpc_api.clone(),
+            self.note_observers.clone(),
+            self.tx_discard_delta,
+        );
         let input = self.build_sync_input().await?;
 
         let mut partial_mmr = self.get_current_partial_mmr().await?;

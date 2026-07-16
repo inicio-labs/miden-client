@@ -358,6 +358,42 @@ use store::Store;
 use crate::note_transport::NoteTransportClient;
 use crate::transaction::TransactionProver;
 
+// OBSERVER REGISTRATION
+// ================================================================================================
+
+/// Unifies the `name()` both observer traits already expose, so [`push_deduped`] can dedup either
+/// kind by name.
+pub(crate) trait NamedObserver {
+    fn observer_name(&self) -> &'static str;
+}
+
+impl NamedObserver for dyn transaction::TransactionObserver {
+    fn observer_name(&self) -> &'static str {
+        self.name()
+    }
+}
+
+impl NamedObserver for dyn sync::OnNoteReceived {
+    fn observer_name(&self) -> &'static str {
+        self.name()
+    }
+}
+
+/// Appends `observer` to `list` unless one with the same name is already present, so a user cannot
+/// accidentally register the same observer twice. A dropped duplicate is logged (observers with a
+/// shared name — e.g. two left on the default — collide, so the collision is made visible).
+pub(crate) fn push_deduped<T: NamedObserver + ?Sized>(list: &mut Vec<Arc<T>>, observer: Arc<T>) {
+    let name = observer.observer_name();
+    if list.iter().any(|existing| existing.observer_name() == name) {
+        tracing::warn!(
+            observer = name,
+            "an observer with this name is already registered; ignoring the duplicate"
+        );
+    } else {
+        list.push(observer);
+    }
+}
+
 // MIDEN CLIENT
 // ================================================================================================
 
@@ -404,9 +440,12 @@ pub struct Client<AUTH> {
     /// Cached [`PartialMmr`] for the chain's MMR. Lazily built from the store and kept in sync
     /// across sync/prune operations. `None` forces a rebuild on next access.
     partial_mmr: Option<CachedPartialMmr>,
-    /// Observers fired by `apply_transaction`. See
-    /// [`Client::with_transaction_observer`].
+    /// Observers fired by `apply_transaction`, registered at build time via the builder's
+    /// `with_transaction_observer`.
     transaction_observers: Vec<Arc<dyn transaction::TransactionObserver>>,
+    /// Per-note sync observers seeded into [`StateSync`](crate::sync::StateSync) on every sync,
+    /// screener first. All observers are distinct — deduplicated by name.
+    note_observers: Vec<Arc<dyn sync::OnNoteReceived>>,
 }
 
 /// Cached [`PartialMmr`] with a two-part freshness fingerprint:
@@ -498,14 +537,6 @@ impl<AUTH> Client<AUTH> {
         self.store.identifier()
     }
 
-    /// Registers a [`transaction::TransactionObserver`]. Per-observer failures are logged.
-    pub fn with_transaction_observer(
-        &mut self,
-        observer: Arc<dyn transaction::TransactionObserver>,
-    ) {
-        self.transaction_observers.push(observer);
-    }
-
     /// Returns the network ID of the node the client is connected to.
     pub async fn network_id(&self) -> Result<address::NetworkId, ClientError> {
         Ok(self.rpc_api.get_network_id().await?)
@@ -513,6 +544,19 @@ impl<AUTH> Client<AUTH> {
 
     // TEST HELPERS
     // --------------------------------------------------------------------------------------------
+
+    /// The [`name`](sync::OnNoteReceived::name) of each registered note observer, screener first.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn note_observer_names(&self) -> Vec<&'static str> {
+        self.note_observers.iter().map(|observer| observer.name()).collect()
+    }
+
+    /// The [`name`](transaction::TransactionObserver::name) of each registered transaction
+    /// observer.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn transaction_observer_names(&self) -> Vec<&'static str> {
+        self.transaction_observers.iter().map(|observer| observer.name()).collect()
+    }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn test_rpc_api(&mut self) -> &mut Arc<dyn NodeRpcClient> {

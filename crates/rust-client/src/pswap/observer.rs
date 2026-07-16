@@ -53,6 +53,12 @@ impl OnNoteReceived for PswapChainObserver {
         "PswapChainObserver"
     }
 
+    fn on_sync_start(&self) {
+        // A prior sync may have observed notes but errored before `apply` drained them; start each
+        // sync with an empty collector so stale observations never bleed into this sync.
+        self.chain_note_updates.write().clear();
+    }
+
     async fn on_note_received(
         &self,
         committed_note: &CommittedNote,
